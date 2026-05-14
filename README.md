@@ -103,8 +103,8 @@ brlfetch -j      # machine-readable JSON (for status bars / dashboards)
 brlfetch -m 2>/dev/null
 ```
 
-A small Easter egg: `brlfetch <distro>` (arch, fedora, debian, gentoo, alpine, …) renders the panel as if the system were that distro — small logos, plausible package counts, distro-shaped kernel suffix. `brlfetch -h` does not reveal the persona list; unknown names silently fall back to Bedrock. Disable with `--no-disguise`.
-
+A small Easter egg: `brlfetch <distro>` (arch, fedora, debian, gentoo, alpine, …) renders the panel as if the system were that distro — small logos, plausible package counts, distro-shaped kernel suffix. `brlfetch -h` does not reveal the persona list; unknown names silently fall back to Bedrock. Disable with `--no- disguise`. ( THIS IS A WORK IN PROGRESS THE ICONS ARENT ACCURATE )
+ 
 ### `brlmon` — process monitor
 
 ```sh
