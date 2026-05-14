@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""brltools — index of the Bedrock toolset. Prints what's available and exits."""
+
+from __future__ import annotations
+
+import os
+import sys
+
+import shutil
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+except ImportError:
+    sys.stderr.write(
+        "brltools needs python-rich. Install via your distro pm:\n"
+        "  arch: python-rich   fedora/debian: python3-rich   any: pip install --user rich\n"
+    )
+    sys.exit(1)
+
+console = Console()
+
+
+def find_tool(name: str) -> str | None:
+    """Locate a registered tool — checks $PATH first, then ~/bin and the
+    common system install dirs so brltools works whether the tools live
+    under the user's home or under /usr/local/bin."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for path in (os.path.expanduser(f'~/bin/{name}'),
+                 f'/usr/local/bin/{name}',
+                 f'/usr/bin/{name}'):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Registry
+# ───────────────────────────────────────────────────────────────────────────
+
+TOOLS = [
+    ('brldoc',
+     'audit & auto-fix',
+     'Health-checks every Bedrock breakage point (strata, systemd, dbus, .desktop paths, pinning, /etc, updates) and offers auto-fixes. Run without args; -h for the full check list.'),
+    ('brlfetch',
+     'system info',
+     'Bedrock-exclusive fastfetch-style summary — strata + pkg counts, hijacked-from distro, bootloader. -m for a compact shell-startup view.'),
+    ('brlmon',
+     'process monitor',
+     'Live htop-style TUI with an extra STRATUM column showing which stratum each process is running from. Scrollable; space to pause.'),
+    ('brl-erase',
+     'fuzzy package remover',
+     'Cross-stratum fuzzy package removal — `brl-erase chrome` finds and deletes every chrome* match in any stratum. Triple-confirms kernel/boot/libc matches.'),
+]
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Render
+# ───────────────────────────────────────────────────────────────────────────
+
+def render():
+    console.print(Panel.fit(
+        '[bold cyan]brltools[/bold cyan]\n'
+        '[dim]the Bedrock Linux toolset[/dim]',
+        border_style='cyan',
+    ))
+
+    table = Table(show_header=True, header_style='bold cyan', box=None,
+                  pad_edge=False, padding=(0, 2))
+    table.add_column('tool', style='bold')
+    table.add_column('role', style='magenta')
+    table.add_column('description')
+
+    for name, role, desc in TOOLS:
+        installed = find_tool(name) is not None
+        name_cell = f'[bold]{name}[/bold]' if installed else f'[dim]{name} (missing)[/dim]'
+        table.add_row(name_cell, role, desc)
+
+    console.print(table)
+    console.print(
+        '\n[dim]Each tool has its own [bold]-h[/bold] for flags. '
+        'They all bail out with a friendly message on non-Bedrock systems '
+        '(use [bold]--run_test[/bold] to preview).[/dim]'
+    )
+
+
+def render_version():
+    import datetime
+    table = Table(show_header=True, header_style='bold cyan', box=None,
+                  pad_edge=False, padding=(0, 2))
+    table.add_column('tool', style='bold')
+    table.add_column('path')
+    table.add_column('size', justify='right', style='dim')
+    table.add_column('last modified', style='dim')
+    for name, _, _ in TOOLS:
+        path = find_tool(name)
+        if not path:
+            table.add_row(f'[dim]{name}[/dim]', '[red](missing)[/red]', '', '')
+            continue
+        st = os.stat(path)
+        when = datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')
+        table.add_row(name, path, f'{st.st_size:,} B', when)
+    console.print(table)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] in ('-h', '--help'):
+        console.print(
+            '[bold]brltools[/bold] — print the index of Bedrock tools.\n'
+            'Flags: [bold]-V[/bold]/[bold]--version[/bold]  show file sizes + mtimes for each tool.\n'
+            'For each tool\'s own flags, run [bold]<tool> -h[/bold].'
+        )
+        sys.exit(0)
+    if len(sys.argv) > 1 and sys.argv[1] in ('-V', '--version'):
+        render_version()
+        sys.exit(0)
+    render()

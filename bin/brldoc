@@ -1,0 +1,1648 @@
+#!/usr/bin/env python3
+"""brldoc — TUI health check & auto-fix for Bedrock Linux.
+
+Scans every breakage point that Bedrock's stratum model introduces:
+strata health, .desktop Exec paths, pinned binaries, systemd (user + system),
+D-Bus (session + system), PID 1 hang signature, /etc cross-file consistency,
+XDG runtime dir, package updates.
+
+See `brldoc -h` for the full list of checks and flags.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+try:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+    from rich.prompt import Confirm
+    from rich.table import Table
+except ImportError:
+    sys.stderr.write(
+        "brldoc needs python-rich. Install via your distro pm:\n"
+        "  arch: python-rich   fedora/debian: python3-rich   any: pip install --user rich\n"
+    )
+    sys.exit(1)
+
+console = Console()
+
+SEV = {
+    'ok':    ('green',  '✓'),
+    'info':  ('cyan',   'i'),
+    'warn':  ('yellow', '!'),
+    'error': ('red',    '✗'),
+}
+
+
+@dataclass
+class Issue:
+    category: str
+    severity: str
+    summary: str
+    detail: str = ''
+    fix: Optional[Callable[[], tuple[bool, str]]] = None
+    fix_description: str = ''
+    requires_sudo: bool = False
+
+
+def run(cmd, timeout=None, **kw):
+    kw.setdefault('stdout', subprocess.PIPE)
+    kw.setdefault('stderr', subprocess.PIPE)
+    kw.setdefault('text', True)
+    try:
+        return subprocess.run(cmd, timeout=timeout, **kw)
+    except subprocess.TimeoutExpired:
+        class R:
+            returncode = 124
+            stdout = ''
+            stderr = f'timeout after {timeout}s'
+        return R()
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Helpers
+# ───────────────────────────────────────────────────────────────────────────
+
+def _user_uid() -> int:
+    """The real (non-root) user's UID, even when we sudo'd."""
+    return int(os.environ.get('SUDO_UID') or os.getuid())
+
+
+def _user_name() -> str:
+    sudo_user = os.environ.get('SUDO_USER')
+    if sudo_user:
+        return sudo_user
+    import pwd
+    return pwd.getpwuid(os.getuid()).pw_name
+
+
+def run_as_user(cmd, **kw):
+    """Run a command in the original user's session context.
+
+    When the script is running as root via `sudo`, we re-enter the user's
+    session (XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS) so user-level checks
+    actually probe the user's bus / systemd / runtime dir, not root's empty
+    session. When the script is run directly by the user, this is a no-op.
+    """
+    if os.geteuid() == 0 and os.environ.get('SUDO_USER'):
+        uid = _user_uid()
+        env_vars = [
+            f'XDG_RUNTIME_DIR=/run/user/{uid}',
+            f'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus',
+        ]
+        cmd = ['sudo', '-u', _user_name(), 'env'] + env_vars + list(cmd)
+    return run(cmd, **kw)
+
+
+def list_strata() -> list[str]:
+    out = run(['brl', 'list']).stdout
+    return [s.strip() for s in out.splitlines() if s.strip()]
+
+
+def detect_pkg_manager(stratum: str) -> Optional[str]:
+    for pm in ('pacman', 'dnf', 'apt-get', 'apt', 'zypper', 'xbps-install', 'apk'):
+        for base in ('/usr/bin', '/bin', '/usr/local/bin'):
+            if os.path.isfile(f'/bedrock/strata/{stratum}{base}/{pm}'):
+                return pm
+    return None
+
+
+def find_binary_owner(name: str) -> Optional[str]:
+    if not os.path.isdir('/bedrock/strata'):
+        return None
+    for s in os.listdir('/bedrock/strata'):
+        for base in ('/usr/bin', '/usr/local/bin', '/bin'):
+            if os.path.isfile(f'/bedrock/strata/{s}{base}/{name}'):
+                return s
+    return None
+
+
+def file_hash(path: str) -> Optional[str]:
+    try:
+        with open(path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Check: stratum health
+# ───────────────────────────────────────────────────────────────────────────
+
+def _fix_brl_repair(name: str):
+    def fn():
+        r = run(['sudo', 'brl', 'repair', name], stdout=None, stderr=None)
+        return r.returncode == 0, f'exit {r.returncode}'
+    return fn
+
+
+def check_strata_health() -> list[Issue]:
+    out = run(['brl', 'status']).stdout
+    issues = []
+    for line in out.splitlines():
+        line = line.strip()
+        if ':' not in line:
+            continue
+        name, status = (x.strip() for x in line.split(':', 1))
+        if status == 'enabled':
+            issues.append(Issue('stratum', 'ok', f'{name}: enabled'))
+        else:
+            issues.append(Issue(
+                'stratum', 'error', f'{name}: {status}',
+                detail='brl repair will rebuild integration files for this stratum.',
+                fix=_fix_brl_repair(name),
+                fix_description=f'sudo brl repair {name}',
+                requires_sudo=True,
+            ))
+    return issues
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Check: PID 1 systemd hung in do_wait
+# ───────────────────────────────────────────────────────────────────────────
+
+def check_pid1_hang() -> list[Issue]:
+    try:
+        with open('/proc/1/stack', 'r') as f:
+            stack = f.read()
+    except (PermissionError, FileNotFoundError):
+        return [Issue('pid1', 'info',
+                      'PID 1 stack: insufficient permissions (try `sudo brldoc`)')]
+    if 'do_wait' in stack:
+        return [Issue(
+            'pid1', 'error', 'PID 1 systemd hung in do_wait',
+            detail='Known Bedrock signature for silent flatpak/kitty/sudo failures. Reboot is the only fix.',
+        )]
+    return [Issue('pid1', 'ok', 'PID 1 systemd: responsive')]
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Check: systemd --user
+# ───────────────────────────────────────────────────────────────────────────
+
+def _fix_reset_failed_user():
+    def fn():
+        r = run_as_user(['systemctl', '--user', 'reset-failed'])
+        return r.returncode == 0, f'exit {r.returncode}'
+    return fn
+
+
+def check_systemd_user() -> list[Issue]:
+    r = run_as_user(['systemctl', '--user', 'is-system-running'], timeout=5)
+    state = (r.stdout or r.stderr).strip()
+    if r.returncode == 124:
+        return [Issue('systemd', 'error',
+                      'systemd --user: did not respond in 5s — likely hung',
+                      detail='If the kitty/flatpak hang signature is present, a reboot may be required.')]
+    if state == 'running':
+        return [Issue('systemd', 'ok', 'systemd --user: running')]
+    if state == 'degraded':
+        failed = run_as_user(['systemctl', '--user', '--failed', '--no-legend']).stdout
+        names = []
+        for line in failed.splitlines():
+            for tok in line.split():
+                if '.' in tok and not tok.startswith('●'):
+                    names.append(tok)
+                    break
+        detail = '\n'.join(f'  · {n}' for n in names) if names else ''
+        return [Issue(
+            'systemd', 'warn',
+            f'systemd --user: degraded ({len(names)} failed unit(s))',
+            detail=detail,
+            fix=_fix_reset_failed_user(),
+            fix_description='systemctl --user reset-failed (clears failed states)',
+        )]
+    return [Issue('systemd', 'error', f'systemd --user: {state or "unknown state"}')]
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Check: systemd --system
+# ───────────────────────────────────────────────────────────────────────────
+
+def check_systemd_system() -> list[Issue]:
+    r = run(['systemctl', 'is-system-running'], timeout=5)
+    state = (r.stdout or r.stderr).strip()
+    if r.returncode == 124:
+        return [Issue('syssd', 'error',
+                      'systemd --system: did not respond in 5s — PID 1 may be hung',
+                      detail='Cross-check with PID 1 stack signature above.')]
+    if state == 'running':
+        return [Issue('syssd', 'ok', 'systemd --system: running')]
+    if state == 'degraded':
+        failed = run(['systemctl', '--failed', '--no-legend']).stdout
+        names = []
+        for line in failed.splitlines():
+            for tok in line.split():
+                if '.' in tok and not tok.startswith('●'):
+                    names.append(tok)
+                    break
+        return [Issue(
+            'syssd', 'warn',
+            f'systemd --system: degraded ({len(names)} failed unit(s))',
+            detail='\n'.join(f'  · {n}' for n in names),
+        )]
+    return [Issue('syssd', 'error', f'systemd --system: {state or "unknown state"}')]
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Check: D-Bus (session + system)
+# ───────────────────────────────────────────────────────────────────────────
+
+def _dbus_ping(bus_arg: str, as_user: bool = False) -> tuple[bool, str]:
+    cmd = ['dbus-send', bus_arg, '--print-reply', '--reply-timeout=3000',
+           '--dest=org.freedesktop.DBus', '/org/freedesktop/DBus',
+           'org.freedesktop.DBus.GetId']
+    r = (run_as_user(cmd, timeout=6) if as_user else run(cmd, timeout=6))
+    return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+
+def check_dbus() -> list[Issue]:
+    issues = []
+    uid = _user_uid()
+    sock = f'/run/user/{uid}/bus'
+    if os.path.exists(sock):
+        ok, msg = _dbus_ping('--session', as_user=True)
+        if ok:
+            issues.append(Issue('dbus', 'ok', 'session bus: responding to ping'))
+        else:
+            issues.append(Issue('dbus', 'error',
+                                'session bus: ping failed',
+                                detail=msg[:200] if msg else 'unknown error'))
+    else:
+        issues.append(Issue('dbus', 'error',
+                            f'session bus socket missing: {sock}',
+                            detail='User D-Bus session not started; re-login.'))
+
+    sys_sock = '/run/dbus/system_bus_socket'
+    if os.path.exists(sys_sock):
+        ok, msg = _dbus_ping('--system')
+        if ok:
+            issues.append(Issue('dbus', 'ok', 'system bus: responding to ping'))
+        else:
+            issues.append(Issue('dbus', 'error',
+                                'system bus: ping failed',
+                                detail=msg[:200] if msg else 'unknown error'))
+    else:
+        issues.append(Issue('dbus', 'warn',
+                            f'system bus socket missing: {sys_sock}'))
+    return issues
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Check: XDG runtime dir
+# ───────────────────────────────────────────────────────────────────────────
+
+def check_runtime_dir() -> list[Issue]:
+    uid = _user_uid()
+    rd = f'/run/user/{uid}'
+    issues = []
+    if not os.path.isdir(rd):
+        issues.append(Issue('runtime', 'error',
+                            f'XDG_RUNTIME_DIR does not exist: {rd}'))
+        return issues
+    st = os.stat(rd)
+    if st.st_uid != uid:
+        issues.append(Issue('runtime', 'error',
+                            f'{rd}: owned by uid {st.st_uid}, expected {uid}'))
+    else:
+        access_ok = os.access(rd, os.W_OK) if os.geteuid() == uid else True
+        if access_ok:
+            issues.append(Issue('runtime', 'ok',
+                                f'{rd}: present, owned by user'))
+        else:
+            issues.append(Issue('runtime', 'error', f'{rd}: not writable by owner'))
+    for s in ['bus']:
+        if not os.path.exists(os.path.join(rd, s)):
+            issues.append(Issue('runtime', 'error',
+                                f'critical socket missing: {rd}/{s}'))
+    for s in ['pipewire-0', 'pulse', 'wayland-1']:
+        if not os.path.exists(os.path.join(rd, s)):
+            issues.append(Issue('runtime', 'info',
+                                f'optional socket missing: {rd}/{s}'))
+    return issues
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Check: cross-stratum /etc consistency
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def check_cross_etc() -> list[Issue]:
+    issues = []
+    if not os.path.isdir('/bedrock/strata'):
+        return issues
+    strata = list_strata()
+    user = (os.environ.get('SUDO_USER')
+            or os.environ.get('USER')
+            or os.environ.get('LOGNAME'))
+    if not user or user == 'root':
+        import pwd
+        sudo_uid = os.environ.get('SUDO_UID')
+        try:
+            uid = int(sudo_uid) if sudo_uid else os.getuid()
+            user = pwd.getpwuid(uid).pw_name
+        except (KeyError, ValueError):
+            user = pwd.getpwuid(os.getuid()).pw_name
+    META = {'bedrock', 'init'}
+    real_strata = [s for s in strata if s not in META]
+    bad_user = []
+    bad_host = []
+    for s in real_strata:
+        r = run(['strat', s, 'getent', 'passwd', user], timeout=5)
+        if r.returncode != 0 or user not in r.stdout:
+            bad_user.append(s)
+        r = run(['strat', s, 'hostname'], timeout=5)
+        if r.returncode != 0:
+            bad_host.append(s)
+    canonical_host = run(['hostname']).stdout.strip()
+    host_mismatch = []
+    for s in strata:
+        r = run(['strat', s, 'hostname'], timeout=5)
+        if r.returncode == 0 and r.stdout.strip() and r.stdout.strip() != canonical_host:
+            host_mismatch.append((s, r.stdout.strip()))
+    if bad_user:
+        for s in bad_user:
+            issues.append(Issue(
+                'files', 'error',
+                f'user {user!r} not resolvable from stratum {s}',
+                detail='Stratum cannot getent the user — sudo/login from this stratum will fail.'))
+    if host_mismatch:
+        for s, h in host_mismatch:
+            issues.append(Issue(
+                'files', 'warn',
+                f'hostname mismatch in stratum {s}: {h!r} vs {canonical_host!r}'))
+    if not bad_user and not host_mismatch:
+        issues.append(Issue(
+            'files', 'ok',
+            f'user + hostname resolve consistently across {len(strata)} strata'))
+    return issues
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Check: pinned binaries
+# ───────────────────────────────────────────────────────────────────────────
+
+def check_pinned_bins() -> list[Issue]:
+    pin = '/bedrock/cross/pin/bin'
+    if not os.path.isdir(pin):
+        return [Issue('pinning', 'info', 'no pinned-bin directory')]
+    issues, bad = [], []
+    for name in sorted(os.listdir(pin)):
+        if not os.path.exists(os.path.join(pin, name)):
+            bad.append(name)
+    if bad:
+        for n in bad:
+            issues.append(Issue('pinning', 'warn', f'pinned binary unresolved: {n}'))
+    else:
+        issues.append(Issue('pinning', 'ok',
+                            f'all pinned binaries resolve OK ({len(os.listdir(pin))} pins)'))
+    return issues
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Check: .desktop Exec paths reachable from current stratum
+# ───────────────────────────────────────────────────────────────────────────
+
+def _rewrite_exec(path: str, old: str, new: str):
+    """Rewrite Exec=old → Exec=new. Falls back to writing a user override in
+    ~/.local/share/applications/ if the source file isn't writable (avoiding
+    sudo edits to system .desktop files — XDG already lets us override)."""
+    def fn():
+        if os.access(path, os.W_OK):
+            try:
+                with open(path, 'r') as f:
+                    s = f.read()
+                with open(path, 'w') as f:
+                    f.write(s.replace(old, new))
+                return True, f'rewrote {path}'
+            except OSError as e:
+                return False, str(e)
+        try:
+            user_dir = os.path.expanduser('~/.local/share/applications')
+            os.makedirs(user_dir, exist_ok=True)
+            target = os.path.join(user_dir, os.path.basename(path))
+            with open(path, 'r') as f:
+                content = f.read()
+            with open(target, 'w') as f:
+                f.write(content.replace(old, new))
+            return True, f'wrote override → {target}'
+        except OSError as e:
+            return False, str(e)
+    return fn
+
+
+def check_desktop_entries() -> list[Issue]:
+    issues = []
+    dirs = [
+        '/usr/share/applications',
+        '/usr/local/share/applications',
+        '/bedrock/cross/applications',
+        os.path.expanduser('~/.local/share/applications'),
+        '/var/lib/flatpak/exports/share/applications',
+        os.path.expanduser('~/.local/share/flatpak/exports/share/applications'),
+    ]
+    seen = set()
+    broken, fixable = 0, 0
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for entry in sorted(os.listdir(d)):
+            if not entry.endswith('.desktop'):
+                continue
+            path = os.path.join(d, entry)
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                with open(path, 'r', errors='replace') as f:
+                    content = f.read()
+            except OSError:
+                continue
+            in_main, exec_line = False, None
+            for ln in content.splitlines():
+                t = ln.strip()
+                if t == '[Desktop Entry]':
+                    in_main = True
+                elif t.startswith('[') and in_main:
+                    break
+                elif in_main and t.startswith('Exec='):
+                    exec_line = t[5:]
+                    break
+            if not exec_line:
+                continue
+            head = exec_line.split(None, 1)[0]
+            if not head.startswith('/') or os.path.exists(head):
+                continue
+            broken += 1
+            base = os.path.basename(head)
+            cross = f'/bedrock/cross/bin/{base}'
+            if os.path.exists(cross):
+                fixable += 1
+                issues.append(Issue(
+                    'desktop', 'error',
+                    f'{entry}: broken Exec ({head})',
+                    detail='  binary not visible from current stratum',
+                    fix=_rewrite_exec(path, head, cross),
+                    fix_description=f'rewrite Exec → {cross}',
+                ))
+            else:
+                owner = find_binary_owner(base)
+                if owner:
+                    new_head = f'/bedrock/bin/strat {owner} {base}'
+                    fixable += 1
+                    issues.append(Issue(
+                        'desktop', 'error',
+                        f'{entry}: broken Exec ({head})',
+                        detail=f'  owner: stratum "{owner}" — no cross-bin entry',
+                        fix=_rewrite_exec(path, head, new_head),
+                        fix_description=f'rewrite Exec → strat {owner} {base}',
+                    ))
+                else:
+                    issues.append(Issue(
+                        'desktop', 'warn',
+                        f'{entry}: broken Exec ({head})',
+                        detail='  binary not found in any stratum — manual fix needed',
+                    ))
+    issues.insert(0, Issue(
+        'desktop', 'ok' if broken == 0 else 'info',
+        f'scanned {len(seen)} .desktop entries — {broken} broken ({fixable} auto-fixable)'
+    ))
+    return issues
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Check: bootloader — Bedrock prefers systemd-boot. Detect GRUB residue.
+# ───────────────────────────────────────────────────────────────────────────
+
+GRUB_PKG = {
+    'pacman':  'grub',
+    'dnf':     'grub2-tools',
+    'apt':     'grub-pc',
+    'apt-get': 'grub-pc',
+    'zypper':  'grub2',
+}
+
+
+def _fix_remove_grub_pkg(stratum: str, pm: str, pkg: str):
+    def fn():
+        if pm == 'pacman':
+            cmd = ['sudo', 'strat', stratum, 'pacman', '-R', '--noconfirm', pkg]
+        elif pm == 'dnf':
+            cmd = ['sudo', 'strat', stratum, 'dnf', '-y', 'remove', pkg]
+        elif pm in ('apt', 'apt-get'):
+            cmd = ['sudo', 'strat', stratum, 'apt-get', '-y', 'purge', pkg]
+        elif pm == 'zypper':
+            cmd = ['sudo', 'strat', stratum, 'zypper', '--non-interactive', 'remove', pkg]
+        else:
+            return False, f'unsupported pm: {pm}'
+        r = run(cmd, stdout=None, stderr=None)
+        return r.returncode == 0, f'exit {r.returncode}'
+    return fn
+
+
+def _fix_rmdir(path: str):
+    def fn():
+        r = subprocess.run(['sudo', 'rm', '-rf', path],
+                           capture_output=True, text=True)
+        return r.returncode == 0, r.stderr
+    return fn
+
+
+def _detect_active_bootloader() -> str:
+    """Returns 'systemd-boot', 'grub', or 'unknown' based on EFI BootCurrent."""
+    if not shutil.which('efibootmgr'):
+        return 'unknown'
+    r = run(['efibootmgr', '-v'], timeout=5)
+    if r.returncode != 0:
+        return 'unknown'
+    boot_current = None
+    for line in r.stdout.splitlines():
+        if line.startswith('BootCurrent:'):
+            boot_current = line.split(':', 1)[1].strip()
+            break
+    if not boot_current:
+        return 'unknown'
+    for line in r.stdout.splitlines():
+        if line.startswith(f'Boot{boot_current}'):
+            low = line.lower()
+            if 'systemd-boot' in low or '\\systemd\\' in low.replace('\\\\', '\\'):
+                return 'systemd-boot'
+            if 'grub' in low:
+                return 'grub'
+            return 'unknown'
+    return 'unknown'
+
+
+def check_bootloader() -> list[Issue]:
+    issues = []
+    active = _detect_active_bootloader()
+    sb_installed = active == 'systemd-boot'
+
+    grub_dirs = [p for p in ('/boot/grub', '/boot/grub2',
+                             '/boot/efi/EFI/grub', '/boot/efi/EFI/grub2',
+                             '/boot/EFI/grub', '/boot/EFI/GRUB')
+                 if os.path.isdir(p)]
+
+    grub_pkgs = []
+    for s in list_strata():
+        pm = detect_pkg_manager(s)
+        pkg = GRUB_PKG.get(pm)
+        if not pkg:
+            continue
+        if pm == 'pacman':
+            r = run(['strat', s, 'pacman', '-Qq', pkg], timeout=5)
+        elif pm == 'dnf':
+            r = run(['strat', s, 'rpm', '-q', pkg], timeout=5)
+        elif pm in ('apt', 'apt-get'):
+            r = run(['strat', s, 'dpkg-query', '-W', '-f=${Status}', pkg], timeout=5)
+            if r.returncode == 0 and 'install ok installed' not in r.stdout:
+                continue
+        else:
+            continue
+        if r.returncode == 0:
+            grub_pkgs.append((s, pm, pkg))
+
+    if active == 'systemd-boot':
+        issues.append(Issue('bootloader', 'ok',
+                            'systemd-boot: active (per EFI BootCurrent)'))
+    elif active == 'grub':
+        issues.append(Issue(
+            'bootloader', 'warn',
+            'GRUB is your active bootloader (Bedrock prefers systemd-boot)',
+            detail='Migration: sudo bootctl install, then update EFI BootOrder via efibootmgr. '
+                   'Auto-fix disabled — manual step recommended to avoid bricking boot.',
+        ))
+    else:
+        issues.append(Issue('bootloader', 'info',
+                            f'active bootloader: unknown (efibootmgr available: '
+                            f'{bool(shutil.which("efibootmgr"))})'))
+
+    if grub_pkgs and sb_installed:
+        for s, pm, pkg in grub_pkgs:
+            issues.append(_build_removal_issue(
+                category='bootloader',
+                summary=f'GRUB package "{pkg}" installed in stratum {s}',
+                detail_prefix='  systemd-boot is your active bootloader — this GRUB '
+                              'package is unused residue.\n',
+                stratum=s, pm=pm, pkg=pkg,
+            ))
+    elif grub_pkgs and not sb_installed:
+        for s, pm, pkg in grub_pkgs:
+            issues.append(Issue(
+                'bootloader', 'error',
+                f'GRUB package "{pkg}" present in stratum {s} AND no systemd-boot',
+                detail='Removing GRUB without first installing systemd-boot would brick boot. '
+                       'Install systemd-boot first: sudo bootctl install',
+            ))
+
+    if grub_dirs and sb_installed:
+        for d in grub_dirs:
+            issues.append(Issue(
+                'bootloader', 'warn',
+                f'GRUB directory residue: {d}',
+                detail='Not used by your active bootloader (systemd-boot). Safe to delete.',
+                fix=_fix_rmdir(d),
+                fix_description=f'sudo rm -rf {d}',
+                requires_sudo=True,
+            ))
+
+    if not grub_pkgs and not grub_dirs and sb_installed:
+        issues.append(Issue('bootloader', 'ok', 'no GRUB residue detected'))
+
+    return issues
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Check: duplicated user-facing binaries across strata
+# ───────────────────────────────────────────────────────────────────────────
+
+_BASE_BINS = frozenset({
+    'bash', 'sh', 'dash', 'ls', 'cat', 'cp', 'mv', 'rm', 'mkdir', 'rmdir',
+    'echo', 'pwd', 'env', 'true', 'false', 'sleep', 'date', 'grep', 'sed',
+    'awk', 'sort', 'uniq', 'cut', 'tr', 'head', 'tail', 'wc', 'find',
+    'ln', 'chmod', 'chown', 'stat', 'df', 'du', 'mount', 'umount', 'ps',
+    'kill', 'su', 'sudo', 'login', 'passwd', 'useradd', 'usermod',
+    'systemctl', 'journalctl', 'dmesg', 'getent', 'getopt', 'tee', 'xargs',
+    'tar', 'gzip', 'gunzip', 'bzip2', 'xz', 'zstd', 'cpio',
+    'less', 'more', 'nano', 'vi', 'man', 'whoami', 'id', 'hostname',
+})
+
+
+def _detect_active_stratum(binary: str, owners: list[str]) -> Optional[str]:
+    """Which stratum's copy of <binary> wins cross-stratum routing?"""
+    r = run(['brl', 'which', '--bin', binary], timeout=3)
+    if r.returncode == 0:
+        for line in r.stdout.splitlines():
+            tok = line.strip().split()[0] if line.strip() else ''
+            if tok in owners:
+                return tok
+    cross = f'/bedrock/cross/bin/{binary}'
+    try:
+        real = os.path.realpath(cross)
+        if '/bedrock/strata/' in real:
+            return real.split('/bedrock/strata/', 1)[1].split('/', 1)[0]
+    except OSError:
+        pass
+    return None
+
+
+def _owning_package(stratum: str, pm: str, bin_path: str) -> Optional[str]:
+    if pm == 'pacman':
+        r = run(['strat', stratum, 'pacman', '-Qoq', bin_path], timeout=5)
+    elif pm == 'dnf':
+        r = run(['strat', stratum, 'rpm', '-qf', '--queryformat', '%{NAME}\n',
+                 bin_path], timeout=5)
+    elif pm in ('apt', 'apt-get'):
+        r = run(['strat', stratum, 'dpkg-query', '-S', bin_path], timeout=5)
+        if r.returncode == 0 and ':' in r.stdout:
+            return r.stdout.split(':', 1)[0].strip()
+        return None
+    else:
+        return None
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip().splitlines()[0].strip()
+    return None
+
+
+def _fix_remove_package(stratum: str, pm: str, pkg: str):
+    def fn():
+        if pm == 'pacman':
+            cmd = ['sudo', 'strat', stratum, 'pacman', '-Rs', '--noconfirm', pkg]
+        elif pm == 'dnf':
+            cmd = ['sudo', 'strat', stratum, 'dnf', '-y', 'remove', pkg]
+        elif pm in ('apt', 'apt-get'):
+            cmd = ['sudo', 'strat', stratum, 'apt-get', '-y', 'purge', pkg]
+        else:
+            return False, f'unsupported pm: {pm}'
+        r = run(cmd, stdout=None, stderr=None)
+        return r.returncode == 0, f'exit {r.returncode}'
+    return fn
+
+
+@dataclass
+class RemovalPlan:
+    """Result of a package-manager dry-run."""
+    ok: bool
+    would_remove: list[str]
+    error: Optional[str] = None
+
+
+def _simulate_remove(stratum: str, pm: str, pkg: str, cascade: bool = False) -> RemovalPlan:
+    """Dry-run a package removal via the stratum's package manager.
+
+    Asking the PM itself is more reliable than computing reverse deps with
+    `rpm -q --whatrequires` / `pacman -Qi` etc. — those miss:
+      * virtual provides (`xorg-x11-server-Xwayland(x86-64) >= …`)
+      * versioned requires (`grub2-tools = 1:2.12-56.fc44`)
+      * protected/system-critical refusal (dnf's "conflicting requests")
+    """
+    if pm == 'pacman':
+        flag = '-Rcsp' if cascade else '-Rsp'
+        r = run(['strat', stratum, 'pacman', flag, '--print-format', '%n',
+                 '--noconfirm', pkg], timeout=20)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout).strip().splitlines()
+            return RemovalPlan(False, [], (err[-1] if err else 'pacman refused')[:300])
+        return RemovalPlan(True, [l.strip() for l in r.stdout.splitlines() if l.strip()])
+
+    if pm == 'dnf':
+        r = run(['strat', stratum, 'dnf', '--assumeno', 'remove', pkg], timeout=60)
+        combined = (r.stdout or '') + '\n' + (r.stderr or '')
+        bad_signals = ('Failed to resolve', 'No match for argument',
+                       'No package ', 'Cannot remove')
+        if any(s in combined for s in bad_signals):
+            for line in combined.splitlines():
+                if 'Problem:' in line or line.strip().startswith('Error:'):
+                    return RemovalPlan(False, [], line.strip()[:300])
+            return RemovalPlan(False, [], 'dnf could not resolve removal')
+        pkgs: list[str] = []
+        in_remove = False
+        for line in combined.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('Removing'):
+                in_remove = True
+                continue
+            if not in_remove:
+                continue
+            if not stripped or stripped.startswith('Transaction Summary') \
+                    or stripped.startswith('Installing') \
+                    or stripped.startswith('='):
+                in_remove = stripped.startswith('=')
+                continue
+            parts = stripped.split()
+            if parts and parts[0] not in pkgs:
+                pkgs.append(parts[0])
+        return RemovalPlan(True, pkgs)
+
+    if pm in ('apt', 'apt-get'):
+        r = run(['strat', stratum, 'apt-get', '-s', 'remove', '-y', pkg], timeout=20)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout).strip().splitlines()
+            return RemovalPlan(False, [], (err[-1] if err else 'apt refused')[:300])
+        pkgs, capturing = [], False
+        for line in r.stdout.splitlines():
+            if 'will be REMOVED' in line:
+                capturing = True
+                continue
+            if capturing:
+                if line.startswith(' '):
+                    pkgs.extend(line.split())
+                else:
+                    capturing = False
+        return RemovalPlan(True, pkgs)
+
+    return RemovalPlan(False, [], f'unsupported pm: {pm}')
+
+
+def _build_removal_issue(category: str, summary: str, detail_prefix: str,
+                         stratum: str, pm: str, pkg: str) -> Issue:
+    """Construct an Issue for removing <pkg>, simulation-aware.
+
+    Behavior matrix (per the package manager's own opinion):
+      plain dry-run OK, ≤3 pkgs total      → info + plain remove fix
+      plain dry-run OK, >3 pkgs total      → info + plain remove (lists extras)
+      plain dry-run FAILS, cascade OK      → warn + cascade remove (lists chain)
+      plain dry-run FAILS, cascade FAILS   → warn, NO fix (cannot auto-remove)
+    """
+    plan = _simulate_remove(stratum, pm, pkg, cascade=False)
+
+    if plan.ok:
+        extras = [p for p in plan.would_remove if p != pkg]
+        if not extras:
+            return Issue(
+                category=category, severity='info', summary=summary,
+                detail=detail_prefix + '  Plain removal — only this package.',
+                fix=_fix_remove_package(stratum, pm, pkg),
+                fix_description=f'sudo strat {stratum} {pm} remove {pkg}',
+                requires_sudo=True,
+            )
+        preview = ', '.join(extras[:5]) + (f', +{len(extras)-5} more' if len(extras) > 5 else '')
+        return Issue(
+            category=category, severity='info', summary=summary,
+            detail=detail_prefix + f'  Plain removal also sweeps unused deps: {preview}.',
+            fix=_fix_remove_package(stratum, pm, pkg),
+            fix_description=f'sudo strat {stratum} {pm} remove {pkg} (+{len(extras)} orphan dep(s))',
+            requires_sudo=True,
+        )
+
+    plan_cascade = _simulate_remove(stratum, pm, pkg, cascade=True)
+    if not plan_cascade.ok:
+        return Issue(
+            category=category, severity='warn',
+            summary=f'{summary} — cannot auto-remove',
+            detail=(detail_prefix +
+                    f'  Package manager refused both plain and cascade removal.\n'
+                    f'  Plain: {plan.error}\n'
+                    f'  Cascade: {plan_cascade.error}\n'
+                    f'  This is purely cosmetic — active routing is unaffected.'),
+        )
+
+    chain = [p for p in plan_cascade.would_remove if p != pkg]
+    chain_preview = ', '.join(chain[:8]) + (f', +{len(chain)-8} more' if len(chain) > 8 else '')
+    return Issue(
+        category=category, severity='warn',
+        summary=f'{summary} — needs cascade ({len(chain)+1} pkgs)',
+        detail=(detail_prefix +
+                f'  Plain removal refused: {plan.error}\n'
+                f'  Cascade would remove "{pkg}" plus: {chain_preview}.\n'
+                f'  Skip unless you actually want all of those gone.'),
+        fix=_fix_cascade_remove(stratum, pm, pkg),
+        fix_description=f'sudo strat {stratum} {pm} remove (cascade) {pkg} + {len(chain)} dep(s)',
+        requires_sudo=True,
+    )
+
+
+def _fix_cascade_remove(stratum: str, pm: str, pkg: str):
+    """Remove pkg AND everything that depends on it. Used when the duplicate
+    package has installed dependents in its stratum — pacman -Rs would refuse
+    in that case, and the user has explicitly opted into the cascade."""
+    def fn():
+        if pm == 'pacman':
+            cmd = ['sudo', 'strat', stratum, 'pacman', '-Rcs', '--noconfirm', pkg]
+        elif pm == 'dnf':
+            cmd = ['sudo', 'strat', stratum, 'dnf', '-y', 'remove', pkg]
+        elif pm in ('apt', 'apt-get'):
+            cmd = ['sudo', 'strat', stratum, 'apt-get', '-y',
+                   '--auto-remove', 'purge', pkg]
+        else:
+            return False, f'unsupported pm: {pm}'
+        r = run(cmd, stdout=None, stderr=None)
+        return r.returncode == 0, f'exit {r.returncode}'
+    return fn
+
+
+def _user_facing_binaries() -> set[str]:
+    """Names referenced by Exec= in any .desktop file — i.e. apps the user has
+    a launcher for. Used to filter duplicate detection so we don't yell about
+    every libc-shipped tool that legitimately exists in every stratum."""
+    names: set[str] = set()
+    for d in [
+        '/usr/share/applications', '/usr/local/share/applications',
+        '/bedrock/cross/applications',
+        os.path.expanduser('~/.local/share/applications'),
+        '/var/lib/flatpak/exports/share/applications',
+        os.path.expanduser('~/.local/share/flatpak/exports/share/applications'),
+    ]:
+        if not os.path.isdir(d):
+            continue
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.endswith('.desktop'):
+                continue
+            try:
+                with open(os.path.join(d, entry), 'r', errors='replace') as f:
+                    for ln in f:
+                        if ln.startswith('Exec='):
+                            tok = ln[5:].split(None, 1)[0]
+                            name = os.path.basename(tok)
+                            if name:
+                                names.add(name)
+                            break
+            except OSError:
+                continue
+    return names
+
+
+def check_duplicate_packages() -> list[Issue]:
+    cross = '/bedrock/cross/bin'
+    if not os.path.isdir(cross):
+        return []
+    META = {'bedrock', 'init'}
+    strata = [s for s in list_strata() if s not in META]
+    if len(strata) < 2:
+        return [Issue('dupes', 'ok',
+                      f'only {len(strata)} non-meta stratum — nothing to dedupe')]
+
+    facing = _user_facing_binaries()
+
+    duplicates: list[tuple[str, list[str]]] = []
+    for binary in sorted(os.listdir(cross)):
+        if binary in _BASE_BINS or binary not in facing:
+            continue
+        owners = [s for s in strata
+                  if os.path.isfile(f'/bedrock/strata/{s}/usr/bin/{binary}')]
+        if len(owners) >= 2:
+            duplicates.append((binary, owners))
+
+    issues: list[Issue] = []
+    if not duplicates:
+        issues.append(Issue('dupes', 'ok',
+                            'no cross-stratum app duplicates detected'))
+        return issues
+
+    issues.append(Issue('dupes', 'info',
+                        f'{len(duplicates)} binary name(s) present in multiple strata'))
+
+    seen_pkg_per_stratum: set[tuple[str, str]] = set()
+    for binary, owners in duplicates[:25]:
+        winner = _detect_active_stratum(binary, owners)
+        if not winner:
+            issues.append(Issue('dupes', 'warn',
+                                f'{binary}: in {", ".join(owners)} '
+                                f'— routing winner could not be determined'))
+            continue
+        losers = [s for s in owners if s != winner]
+        for loser in losers:
+            pm = detect_pkg_manager(loser)
+            if not pm:
+                continue
+            pkg = _owning_package(loser, pm, f'/usr/bin/{binary}')
+            if not pkg:
+                continue
+            key = (loser, pkg)
+            if key in seen_pkg_per_stratum:
+                continue
+            seen_pkg_per_stratum.add(key)
+
+            issues.append(_build_removal_issue(
+                category='dupes',
+                summary=f'{binary}: routed via "{winner}"; duplicate "{pkg}" in {loser}',
+                detail_prefix=f'  Active routing already uses {winner}, so removing '
+                              f'"{pkg}" from {loser} is purely housekeeping.\n',
+                stratum=loser, pm=pm, pkg=pkg,
+            ))
+    return issues
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Deep checks (--deep mode only)
+# ───────────────────────────────────────────────────────────────────────────
+
+def check_pkg_integrity_deep() -> list[Issue]:
+    """Per-stratum package file-integrity check. Slow; --deep only."""
+    issues = []
+    for s in list_strata():
+        pm = detect_pkg_manager(s)
+        if pm == 'pacman':
+            r = run(['strat', s, 'sh', '-c',
+                     'pacman -Qkq 2>/dev/null | wc -l'], timeout=120)
+        elif pm == 'dnf':
+            r = run(['strat', s, 'sh', '-c',
+                     'rpm -Va 2>/dev/null | wc -l'], timeout=120)
+        elif pm in ('apt', 'apt-get'):
+            r = run(['strat', s, 'sh', '-c',
+                     'dpkg --verify 2>/dev/null | wc -l'], timeout=120)
+        else:
+            continue
+        try:
+            n = int(r.stdout.strip() or '0')
+        except ValueError:
+            n = 0
+        if n == 0:
+            issues.append(Issue('deep', 'ok', f'{s} ({pm}): file integrity OK'))
+        else:
+            issues.append(Issue(
+                'deep', 'warn',
+                f'{s} ({pm}): {n} package file(s) modified/missing',
+                detail=f'Run `strat {s} {pm} ...` to inspect; could be benign config edits.',
+            ))
+    return issues
+
+
+def check_pid1_hang_deep() -> list[Issue]:
+    """Sudo-elevated PID 1 stack read (overrides the normal pid1 check)."""
+    if os.geteuid() == 0:
+        return check_pid1_hang()
+    r = run(['sudo', '-n', 'cat', '/proc/1/stack'], timeout=5)
+    if r.returncode != 0:
+        return [Issue('pid1', 'info', 'PID 1 stack: sudo non-interactive failed')]
+    if 'do_wait' in r.stdout:
+        return [Issue(
+            'pid1', 'error', 'PID 1 systemd hung in do_wait',
+            detail='Known Bedrock signature. Reboot is the only fix.')]
+    return [Issue('pid1', 'ok', 'PID 1 systemd: responsive (deep-checked)')]
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Check: available updates per stratum
+# ───────────────────────────────────────────────────────────────────────────
+
+# ───────────────────────────────────────────────────────────────────────────
+# Check: orphaned packages per stratum
+# ───────────────────────────────────────────────────────────────────────────
+
+def check_orphans() -> list[Issue]:
+    """Detect packages no longer required by anything in their stratum.
+
+    Useful on Bedrock because every stratum's pm accrues orphans independently
+    — a single `pacman -Qdtq` on one stratum won't see arch dnf orphans, etc.
+    Reporting only; no auto-remove (orphan cleanup is policy, not health).
+    """
+    issues: list[Issue] = []
+    META = {'bedrock', 'init'}
+    for s in list_strata():
+        if s in META:
+            continue
+        pm = detect_pkg_manager(s)
+        if not pm:
+            continue
+        cmd = None
+        if pm == 'pacman':
+            cmd = 'pacman -Qdtq 2>/dev/null'
+        elif pm == 'dnf':
+            cmd = "dnf -q repoquery --unneeded --qf '%{name}' 2>/dev/null"
+        elif pm in ('apt', 'apt-get'):
+            cmd = "apt-get -s autoremove 2>/dev/null | awk '/^Remv /{print $2}'"
+        elif pm == 'zypper':
+            cmd = "zypper -q packages --unneeded 2>/dev/null | awk -F'|' 'NR>2{gsub(/ /,\"\",$3); print $3}'"
+        elif pm == 'xbps-install':
+            cmd = 'xbps-query -O 2>/dev/null'
+        if not cmd:
+            continue
+        r = run(['strat', s, 'sh', '-c', cmd], timeout=30)
+        names = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+        if not names:
+            issues.append(Issue('orphans', 'ok', f'{s} ({pm}): no orphans'))
+            continue
+        preview = ', '.join(names[:6]) + (f', +{len(names)-6} more' if len(names) > 6 else '')
+        sev = 'info' if len(names) < 15 else 'warn'
+        issues.append(Issue(
+            'orphans', sev,
+            f'{s} ({pm}): {len(names)} orphan package(s)',
+            detail=f'  {preview}\n  Review then `strat {s} {pm} ...` to clean up.',
+        ))
+    if not issues:
+        issues.append(Issue('orphans', 'info', 'no orphan-aware strata'))
+    return issues
+
+
+def check_updates() -> list[Issue]:
+    issues = []
+    for s in list_strata():
+        pm = detect_pkg_manager(s)
+        if not pm:
+            continue
+        count = 0
+        cmd = None
+        if pm == 'pacman':
+            cmd = 'pacman -Qu 2>/dev/null | wc -l'
+        elif pm == 'dnf':
+            cmd = "dnf -q check-update 2>/dev/null | grep -c '^[a-zA-Z0-9]'"
+        elif pm in ('apt', 'apt-get'):
+            cmd = "apt list --upgradable 2>/dev/null | tail -n +2 | wc -l"
+        elif pm == 'zypper':
+            cmd = "zypper lu 2>/dev/null | grep -c '^v '"
+        elif pm == 'xbps-install':
+            cmd = 'xbps-install -nu 2>/dev/null | wc -l'
+        if cmd:
+            r = run(['strat', s, 'sh', '-c', cmd], timeout=30)
+            try:
+                count = int(r.stdout.strip() or '0')
+            except ValueError:
+                count = 0
+        sev = 'ok' if count == 0 else ('info' if count < 20 else 'warn')
+        label = 'up to date' if count == 0 else f'{count} update(s) pending'
+        issues.append(Issue('updates', sev, f'{s} ({pm}): {label}'))
+    return issues
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Registry + main
+# ───────────────────────────────────────────────────────────────────────────
+
+CHECKS = [
+    ('stratum',    'Stratum health',         check_strata_health,
+        'brl status of every stratum (auto-fix: sudo brl repair)'),
+    ('pid1',       'PID 1 systemd',          check_pid1_hang,
+        'detect known do_wait hang signature in /proc/1/stack'),
+    ('systemd',    'systemd --user',         check_systemd_user,
+        'user systemd state + failed units (auto-fix: reset-failed)'),
+    ('syssd',      'systemd --system',       check_systemd_system,
+        'system systemd state + failed units'),
+    ('dbus',       'D-Bus',                  check_dbus,
+        'session + system bus reachability'),
+    ('runtime',    'XDG runtime dir',        check_runtime_dir,
+        '/run/user/$UID writable + bus/pipewire/pulse/wayland sockets'),
+    ('files',      'Cross-stratum /etc',     check_cross_etc,
+        'user + hostname resolve from every stratum via getent'),
+    ('pinning',    'Pinned binaries',        check_pinned_bins,
+        '/bedrock/cross/pin/bin entries all resolve'),
+    ('bootloader', 'Bootloader',             check_bootloader,
+        'systemd-boot vs GRUB; flag/remove GRUB residue (auto-fix)'),
+    ('dupes',      'Duplicate packages',     check_duplicate_packages,
+        'detect same binary installed in multiple strata; offer to remove loser (auto-fix)'),
+    ('desktop',    'Desktop entries',        check_desktop_entries,
+        'audit every .desktop Exec path; rewrite stratum-broken paths (auto-fix)'),
+    ('orphans',    'Orphaned packages',      check_orphans,
+        'unneeded packages per stratum (pacman -Qdtq / dnf unneeded / apt autoremove)'),
+    ('updates',    'Package updates',        check_updates,
+        'pending updates per stratum (pacman/dnf/apt/zypper/xbps)'),
+]
+
+DEEP_CHECKS = [
+    ('deep',  'Deep package integrity',  check_pkg_integrity_deep,
+        'pacman -Qkq / rpm -Va / dpkg --verify per stratum (slow)'),
+]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    rows = [(k, d) for k, _, _, d in CHECKS] + [(k, d) for k, _, _, d in DEEP_CHECKS]
+    width = max(len(k) for k, _ in rows)
+    check_list = '\n'.join(f'  {k:<{width}}  {d}' for k, d in rows)
+    ap = argparse.ArgumentParser(
+        prog='brldoc',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description='Bedrock Linux health-check & auto-fix TUI.',
+        epilog=(
+            'Available checks:\n' + check_list + '\n\n'
+            'Examples:\n'
+            '  brldoc                  run all checks, prompt before each fix\n'
+            '  brldoc -y               run all checks, auto-apply every fix\n'
+            '  brldoc --check          read-only; show findings, do not fix\n'
+            '  brldoc --only desktop   audit only .desktop Exec paths\n'
+            '  brldoc --deep           re-exec under sudo for full inspection\n'
+            '                          (reads /proc/1/stack, runs package\n'
+            '                          integrity verifiers per stratum)\n'
+        ),
+    )
+    ap.add_argument('-y', '--yes', action='store_true',
+                    help='apply every fix without prompting (and auto-elevate)')
+    ap.add_argument('-c', '--check', action='store_true',
+                    help="check only — don't offer fixes, skip auto-elevation")
+    ap.add_argument('-d', '--deep', action='store_true',
+                    help='enable extra per-stratum integrity checks (implies root)')
+    ap.add_argument('--no-sudo', action='store_true',
+                    help='never auto-elevate; run strictly as current user')
+    ap.add_argument('--only', metavar='CHECK',
+                    choices=[k for k, _, _, _ in CHECKS + DEEP_CHECKS],
+                    help='run only the named check')
+    ap.add_argument('-U', '--update-all', action='store_true',
+                    help='update every stratum (pacman -Syu / dnf upgrade / '
+                         'apt upgrade / apk upgrade / xbps-install -Su / '
+                         'zypper update). Skips the check pipeline entirely.')
+    ap.add_argument('-L', '--list', action='store_true',
+                    help='list available checks and exit')
+    ap.add_argument('--run_test', action='store_true',
+                    help=argparse.SUPPRESS)
+    return ap
+
+
+UPDATE_CMDS = {
+    'pacman':  [['pacman', '-Syu', '--noconfirm']],
+    'dnf':     [['dnf', '-y', 'upgrade', '--refresh']],
+    'apt':     [['apt-get', 'update'], ['apt-get', '-y', 'upgrade']],
+    'apt-get': [['apt-get', 'update'], ['apt-get', '-y', 'upgrade']],
+    'apk':     [['apk', 'update'], ['apk', 'upgrade']],
+    'xbps':    [['xbps-install', '-Suy']],
+    'zypper':  [['zypper', '--non-interactive', 'refresh'],
+                ['zypper', '--non-interactive', 'update']],
+}
+
+
+KNOWN_ERRORS = {
+    r'grub2-editenv: error: failed to get canonical path':
+        "Expected on systemd-boot systems — grub2's post-install scripts run "
+        "even though GRUB isn't your active bootloader. Safe to ignore.",
+    r'grub2-(install|mkconfig).*failed':
+        "Expected on systemd-boot systems — fedora's package hooks try to "
+        "regenerate GRUB config even when GRUB isn't installed. Safe to ignore.",
+    r'No space left on device.*?/boot':
+        "/boot is full. Clear old kernels: `sudo bootctl cleanup` (systemd-boot) "
+        "or remove old kernel packages.",
+    r'database lock|could not lock database':
+        "Another pm instance is running in this stratum. Wait for it to "
+        "finish or check `ps aux | grep <pm>`.",
+    r'GPG.*BADSIG|signature.*from.*is unknown':
+        "Repository GPG key is missing or expired. Refresh keyring: "
+        "`sudo strat <stratum> pacman-key --refresh-keys` (or equivalent).",
+}
+
+
+def _annotate_known_errors(output_text: str) -> list[str]:
+    """Return a list of reassuring notes for any KNOWN_ERRORS regex that matched."""
+    hits = []
+    for pattern, note in KNOWN_ERRORS.items():
+        if re.search(pattern, output_text, re.MULTILINE | re.IGNORECASE):
+            hits.append(note)
+    return hits
+
+
+def _parse_progress(pm: str, line: str) -> tuple[Optional[float], Optional[str]]:
+    s = line.rstrip()
+    pct = None
+    phase = None
+    if pm in ('pacman', 'apk', 'zypper'):
+        m = re.search(r'\((\d+)\s*/\s*(\d+)\)', s)
+        if m:
+            tot = int(m.group(2))
+            if tot > 0:
+                pct = int(m.group(1)) / tot * 100
+    if pm == 'dnf':
+        m = re.search(r'\[\s*(\d+)\s*/\s*(\d+)\s*\]', s)
+        if m:
+            tot = int(m.group(2))
+            if tot > 0:
+                pct = int(m.group(1)) / tot * 100
+    for marker, label in (
+        ('Verifying',  'verifying'),
+        ('Upgrading',  'upgrading'),
+        ('Installing', 'installing'),
+        ('Removing',   'removing'),
+        ('Downloading', 'downloading'),
+        (' installing ', 'installing'),
+        (' upgrading ',  'upgrading'),
+        (' removing ',   'removing'),
+        (' reinstalling ', 'reinstalling'),
+        (' checking ',   'verifying'),
+        ('Get:',       'downloading'),
+        ('Setting up', 'installing'),
+        ('Preparing',  'preparing'),
+        (':: Refreshing', 'refreshing'),
+        (':: Synchronizing', 'syncing'),
+        (':: Retrieving', 'downloading'),
+        (':: Running',   'running hooks'),
+        ('Reading database', 'reading db'),
+        ('Building dependency', 'resolving'),
+    ):
+        if marker in s:
+            phase = label
+            break
+    return pct, phase
+
+
+def _handle_update_errors(errors: list[tuple[str, str, int, list[str]]]):
+    """Show the error panel, surface known-error notes, dispatch non-sudo brldoc,
+    then offer sudo brldoc as the escalation."""
+    console.print()
+    console.print(Panel(
+        f'[bold red]{len(errors)} stratum/strata failed:[/bold red]\n' +
+        '\n'.join(f'  [red]✗[/red] [bold]{s}[/bold] [dim]({pm})[/dim] '
+                  f'→ exit {rc}'
+                  for s, pm, rc, _ in errors),
+        title='[bold red]⚠ Update errors[/bold red]',
+        border_style='red',
+        padding=(1, 2),
+    ))
+
+    all_text = '\n'.join(line for _, _, _, lines in errors for line in lines)
+    notes = _annotate_known_errors(all_text)
+    if notes:
+        console.print()
+        for note in notes:
+            console.print(f'  [cyan]ℹ[/cyan] [dim]{note}[/dim]')
+
+    if not notes:
+        console.print()
+        for s, pm, rc, lines in errors:
+            tail = ''.join(lines[-8:]).rstrip()
+            if tail:
+                console.print(Panel(
+                    f'[dim]{tail}[/dim]',
+                    title=f'[bold]{s}[/bold] [dim]last lines[/dim]',
+                    border_style='dim red',
+                    padding=(0, 1),
+                ))
+
+    sudo_user = os.environ.get('SUDO_USER')
+    if sudo_user:
+        console.print(f'\n[cyan]→ Dispatching non-sudo [bold]brldoc[/bold] '
+                      f'(as {sudo_user}) to scan for resolvable issues…[/cyan]\n')
+        r = subprocess.run(['sudo', '-u', sudo_user, '-E',
+                            'brldoc', '--check', '--no-sudo'])
+        console.print()
+        if r.returncode == 0:
+            console.print('[dim]Non-sudo brldoc finished its scan.[/dim]')
+        else:
+            console.print(f'[yellow]Non-sudo brldoc exited with code '
+                          f'{r.returncode}.[/yellow]')
+    else:
+        console.print('\n[yellow]Could not dispatch non-sudo brldoc — '
+                      'no SUDO_USER env (was brldoc -U run directly as root?)[/yellow]')
+
+    if Confirm.ask(
+        '\n[yellow]Try [bold]sudo brldoc -y[/bold] now to attempt deeper fixes?[/yellow]',
+        default=False,
+    ):
+        os.execvp(sys.executable, [sys.executable, os.path.abspath(__file__), '-y'])
+
+
+def update_all_strata():
+    """Run each enabled stratum's native upgrade in sequence with a per-stratum
+    progress bar. On error, surface known-error reassurances and dispatch
+    non-sudo brldoc to try to resolve, then offer sudo brldoc."""
+    META = {'bedrock', 'init'}
+    targets = [s for s in list_strata() if s not in META]
+    if not targets:
+        console.print('[yellow]No updatable strata found.[/yellow]')
+        return 0
+
+    console.print(Panel.fit(
+        f'[bold cyan]brldoc --update-all[/bold cyan]\n'
+        f'[dim]Updating {len(targets)} stratum/strata in sequence.[/dim]',
+        border_style='cyan',
+    ))
+
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn('[bold cyan]{task.fields[stratum]:<10}[/bold cyan]'),
+        TextColumn('[dim]{task.fields[pm]:<8}[/dim]'),
+        BarColumn(bar_width=28),
+        TextColumn('[bold]{task.percentage:>5.1f}%[/bold]'),
+        TextColumn('[dim]{task.fields[phase]}[/dim]'),
+        console=console,
+        expand=False,
+    )
+
+    task_for: dict[str, int] = {}
+    for s in targets:
+        pm = detect_pkg_manager(s) or 'unknown'
+        task_for[s] = progress.add_task(
+            '', total=100, stratum=s, pm=pm, phase='waiting…',
+        )
+
+    captured: dict[str, list[str]] = {s: [] for s in targets}
+    errors: list[tuple[str, str, int, list[str]]] = []
+
+    with progress:
+        for s in targets:
+            tid = task_for[s]
+            pm = detect_pkg_manager(s)
+            if not pm or pm not in UPDATE_CMDS:
+                progress.update(tid, completed=100, pm=pm or 'unknown',
+                                 phase='[yellow]skipped (no pm)[/yellow]')
+                continue
+            progress.update(tid, pm=pm)
+
+            cmds = UPDATE_CMDS[pm]
+            failed = False
+            for idx, cmd in enumerate(cmds):
+                full = ['strat', s] + cmd
+                base = (idx / len(cmds)) * 100
+                span = 100 / len(cmds)
+                progress.update(tid, completed=base,
+                                 phase=f'{" ".join(cmd[:2])}…')
+
+                proc = subprocess.Popen(
+                    full, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1, env={**os.environ, 'TERM': 'dumb'},
+                )
+                cmd_lines: list[str] = []
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    cmd_lines.append(line)
+                    pct, phase = _parse_progress(pm, line)
+                    if phase:
+                        progress.update(tid, phase=phase)
+                    if pct is not None:
+                        progress.update(tid, completed=base + (pct / 100) * span)
+                proc.wait()
+                captured[s].extend(cmd_lines)
+
+                if proc.returncode != 0:
+                    progress.update(tid,
+                                     phase=f'[red]✗ failed (exit {proc.returncode})[/red]')
+                    errors.append((s, pm, proc.returncode, cmd_lines))
+                    failed = True
+                    break
+
+            if not failed:
+                progress.update(tid, completed=100, phase='[green]✓ done[/green]')
+
+    if errors:
+        _handle_update_errors(errors)
+        return 1
+
+    console.print(f'\n[green]✓ All {len(targets)} stratum/strata updated.[/green]')
+    return 0
+
+
+def confirm_sudo_elevation() -> bool:
+    """Two-step opt-in to running at root level."""
+    console.print(
+        '\n[cyan]brldoc can run as [bold]root[/bold] to perform deep checks '
+        '(read /proc/1/stack, per-stratum package integrity) and auto-fix '
+        'system-level issues (GRUB residue, systemd states, etc.).[/cyan]'
+    )
+    if not Confirm.ask('[bold]Run at root level?[/bold]', default=True):
+        return False
+    console.print(
+        '\n[bold red on yellow]  ⚠  WARNING  [/bold red on yellow]\n'
+        '[yellow]Running as root grants brldoc permission to alter system state '
+        'all the way down to [bold]bootloader configuration[/bold], '
+        '[bold]systemd unit files[/bold], and [bold]per-stratum package '
+        'databases[/bold] — i.e. kernel-adjacent changes. An auto-fix that '
+        'touches boot config can leave the system unbootable if interrupted.[/yellow]'
+    )
+    return Confirm.ask('[bold]Continue at root level?[/bold]', default=False)
+
+
+def render_results(all_issues: list[Issue]):
+    by_cat: dict[str, list[Issue]] = {}
+    for i in all_issues:
+        by_cat.setdefault(i.category, []).append(i)
+    for key, label, _, _ in CHECKS + DEEP_CHECKS:
+        if key not in by_cat:
+            continue
+        table = Table(show_header=False, box=None, pad_edge=False, padding=(0, 1))
+        for i in by_cat[key]:
+            color, mark = SEV[i.severity]
+            table.add_row(f'[{color}]{mark}[/{color}]', i.summary)
+            if i.detail:
+                for ln in i.detail.splitlines():
+                    table.add_row('', f'[dim]{ln}[/dim]')
+        console.print(Panel(table, title=f'[bold]{label}[/bold]',
+                            border_style='blue', padding=(0, 1)))
+
+
+def render_summary(all_issues: list[Issue]):
+    counts = {s: 0 for s in SEV}
+    for i in all_issues:
+        counts[i.severity] = counts.get(i.severity, 0) + 1
+    parts = []
+    for s in ('ok', 'info', 'warn', 'error'):
+        c, _ = SEV[s]
+        parts.append(f'[{c}]{s}: {counts[s]}[/{c}]')
+    console.print(f'\n[bold]Summary[/bold]  ' + '  '.join(parts))
+
+
+def apply_fixes(all_issues: list[Issue], auto_yes: bool, elevated: bool):
+    fixable = [i for i in all_issues if i.fix is not None]
+
+    blocked = [i for i in fixable if i.requires_sudo and not elevated]
+    fixable = [i for i in fixable if not (i.requires_sudo and not elevated)]
+
+    if blocked:
+        console.print(
+            f'\n[yellow]⚠ {len(blocked)} fix(es) need root — '
+            f'not offered. Re-run as `sudo brldoc` to apply.[/yellow]'
+        )
+        for i in blocked:
+            console.print(f'  [dim]· {i.summary}[/dim]')
+
+    if not fixable:
+        if not blocked:
+            console.print('\n[green]Nothing to auto-fix.[/green]')
+        return
+
+    console.rule(f'[bold yellow]{len(fixable)} fix(es) available[/bold yellow]')
+    for i in fixable:
+        color, mark = SEV[i.severity]
+        console.print(f'\n[{color}]{mark}[/{color}] [bold]{i.summary}[/bold]')
+        if i.detail:
+            console.print(f'  [dim]{i.detail.strip()}[/dim]')
+        sudo = ' [yellow](root)[/yellow]' if i.requires_sudo else ''
+        console.print(f'  → [cyan]{i.fix_description}[/cyan]{sudo}')
+        if auto_yes or Confirm.ask('  apply?', default=True):
+            ok, msg = i.fix()
+            if ok:
+                console.print('    [green]✓ fixed[/green]')
+            else:
+                console.print(f'    [red]✗ failed[/red] [dim]{msg}[/dim]')
+        else:
+            console.print('    [dim]skipped[/dim]')
+
+
+def verify_bedrock():
+    """Multiple signals — fail fast (with a fun message) if not on Bedrock."""
+    signals = [
+        ('/bedrock dir exists',  os.path.isdir('/bedrock')),
+        ('/bedrock/cross exists', os.path.isdir('/bedrock/cross')),
+        ('brl on PATH',           shutil.which('brl') is not None),
+    ]
+    if signals[-1][1]:
+        r = run(['brl', 'version'], timeout=3)
+        signals.append(('brl version succeeds',
+                        r.returncode == 0 and 'Bedrock' in r.stdout))
+        signals.append(('brl list non-empty',
+                        bool(run(['brl', 'list'], timeout=3).stdout.strip())))
+    if all(ok for _, ok in signals):
+        return
+    failed = [name for name, ok in signals if not ok]
+    console.print(Panel.fit(
+        "[bold red]Sorry, you don't have bedrock, no wonder why your pc is broken.[/bold red]\n"
+        f"[dim]Failed signals: {', '.join(failed)}[/dim]\n"
+        "[dim](brldoc is for Bedrock Linux systems only — see https://bedrocklinux.org)[/dim]",
+        border_style='red',
+    ))
+    sys.exit(2)
+
+
+def list_checks():
+    table = Table(show_header=True, header_style='bold cyan', box=None,
+                  pad_edge=False, padding=(0, 2))
+    table.add_column('key', style='bold')
+    table.add_column('label', style='magenta')
+    table.add_column('description')
+    for key, label, _, desc in CHECKS:
+        table.add_row(key, label, desc)
+    for key, label, _, desc in DEEP_CHECKS:
+        table.add_row(f'[dim]{key}[/dim]', f'[dim]{label}[/dim]',
+                      f'[dim]{desc}  (deep mode only)[/dim]')
+    console.print(Panel.fit('[bold cyan]brldoc[/bold cyan] checks',
+                            border_style='cyan'))
+    console.print(table)
+
+
+def main():
+    args = build_parser().parse_args()
+
+    if args.list:
+        list_checks()
+        return
+
+    if args.run_test:
+        console.print(Panel.fit(
+            "[bold red]Sorry, you don't have bedrock, no wonder why your pc is broken.[/bold red]\n"
+            "[dim]Failed signals: --run_test forced[/dim]\n"
+            "[dim](brldoc is for Bedrock Linux systems only — see https://bedrocklinux.org)[/dim]",
+            border_style='red',
+        ))
+        sys.exit(2)
+
+    verify_bedrock()
+
+    if args.update_all:
+        if os.geteuid() != 0 and not args.no_sudo:
+            console.print('[cyan]--update-all needs root; elevating via sudo…[/cyan]\n')
+            argv = ['sudo', '-E', sys.executable,
+                    os.path.abspath(__file__)] + sys.argv[1:]
+            os.execvp('sudo', argv)
+            return
+        if os.geteuid() != 0:
+            console.print('[red]✗ --update-all needs root and --no-sudo was set.[/red]')
+            sys.exit(1)
+        sys.exit(update_all_strata())
+
+    if os.geteuid() != 0 and not args.no_sudo and not args.check:
+        if args.yes or args.deep or confirm_sudo_elevation():
+            console.print('[cyan]Elevating via sudo…[/cyan]\n')
+            argv = ['sudo', '-E', sys.executable,
+                    os.path.abspath(__file__)] + sys.argv[1:]
+            os.execvp('sudo', argv)
+            return
+        console.print('[dim]Continuing as regular user '
+                      '(some checks and fixes will be limited).[/dim]\n')
+
+    elevated = os.geteuid() == 0
+    console.print(Panel.fit(
+        '[bold cyan]brldoc[/bold cyan]'
+        + ('  [yellow](root)[/yellow]' if elevated else '')
+        + ('  [magenta](deep)[/magenta]' if args.deep else '')
+        + '\n[dim]health check & auto-fix for Bedrock Linux[/dim]',
+        border_style='cyan',
+    ))
+
+    checks = list(CHECKS)
+    if not elevated:
+        checks = [(k, l, f, d) for k, l, f, d in checks if k != 'bootloader']
+    if elevated:
+        checks = [(k, l, (check_pid1_hang_deep if k == 'pid1' else f), d)
+                  for k, l, f, d in checks]
+    if args.deep and elevated:
+        checks += list(DEEP_CHECKS)
+
+    all_issues: list[Issue] = []
+    with Progress(
+        SpinnerColumn(),
+        TextColumn('[progress.description]{task.description}'),
+        console=console,
+        transient=True,
+    ) as progress:
+        for key, label, fn, _ in checks:
+            if args.only and args.only != key:
+                continue
+            task = progress.add_task(f'Checking {label}…', total=None)
+            try:
+                all_issues.extend(fn())
+            except Exception as e:
+                all_issues.append(Issue(
+                    key, 'error',
+                    f'{label}: check raised {type(e).__name__}',
+                    detail=str(e),
+                ))
+            progress.remove_task(task)
+
+    render_results(all_issues)
+    render_summary(all_issues)
+    if not args.check:
+        apply_fixes(all_issues, auto_yes=args.yes, elevated=elevated)
+
+    if not args.check and not args.only and not args.no_sudo:
+        prompt = '\n[bold]Would you like to update your strata(s)?[/bold]'
+        if args.yes or Confirm.ask(prompt, default=False):
+            if elevated:
+                sys.exit(update_all_strata())
+            console.print('[cyan]Elevating via sudo for --update-all…[/cyan]\n')
+            argv = ['sudo', '-E', sys.executable,
+                    os.path.abspath(__file__), '--update-all']
+            if args.yes:
+                argv.append('-y')
+            os.execvp('sudo', argv)
+
+
+if __name__ == '__main__':
+    main()

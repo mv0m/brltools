@@ -1,0 +1,849 @@
+#!/usr/bin/env python3
+"""brlfetch — Bedrock Linux–exclusive system info, fastfetch-style."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from typing import Optional
+
+try:
+    from rich.align import Align
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+except ImportError:
+    sys.stderr.write(
+        "brlfetch needs python-rich. Install via your distro pm:\n"
+        "  arch: python-rich   fedora/debian: python3-rich   any: pip install --user rich\n"
+    )
+    sys.exit(1)
+
+console = Console()
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Helpers
+# ───────────────────────────────────────────────────────────────────────────
+
+def run(cmd, timeout=5, **kw):
+    kw.setdefault('stdout', subprocess.PIPE)
+    kw.setdefault('stderr', subprocess.PIPE)
+    kw.setdefault('text', True)
+    try:
+        return subprocess.run(cmd, timeout=timeout, **kw)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        class R:
+            returncode = 124
+            stdout = ''
+            stderr = ''
+        return R()
+
+
+def bail():
+    console.print(Panel.fit(
+        "[bold red]Theres nothing hijacked, go do it then fetch me.[/bold red]\n"
+        "[dim](brlfetch is for Bedrock Linux systems only — see https://bedrocklinux.org)[/dim]",
+        border_style='red',
+    ))
+    sys.exit(2)
+
+
+def verify_bedrock():
+    """5-signal Bedrock detection — same as brldoc, identical exit path."""
+    signals = [
+        os.path.isdir('/bedrock'),
+        os.path.isdir('/bedrock/cross'),
+        shutil.which('brl') is not None,
+    ]
+    if signals[-1]:
+        r = run(['brl', 'version'], timeout=3)
+        signals.append(r.returncode == 0 and 'Bedrock' in r.stdout)
+        signals.append(bool(run(['brl', 'list'], timeout=3).stdout.strip()))
+    if not all(signals):
+        bail()
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Info gatherers
+# ───────────────────────────────────────────────────────────────────────────
+
+def get_bedrock_version() -> str:
+    r = run(['brl', 'version'])
+    return (r.stdout.strip() or 'unknown').splitlines()[0]
+
+
+def get_hijacked_from() -> str:
+    """Original distro that Bedrock hijacked, with its current version."""
+    r = run(['brl', 'deref', 'hijacked'])
+    stratum = r.stdout.strip() if r.returncode == 0 else ''
+    if not stratum:
+        return 'unknown'
+    osrel = f'/bedrock/strata/{stratum}/etc/os-release'
+    if not os.path.isfile(osrel):
+        return stratum.capitalize()
+    info: dict[str, str] = {}
+    try:
+        with open(osrel) as f:
+            for line in f:
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    info[k.strip()] = v.strip().strip('"\'')
+    except OSError:
+        return stratum.capitalize()
+    name = info.get('PRETTY_NAME') or info.get('NAME', stratum.capitalize())
+    version = info.get('VERSION_ID', '')
+    if 'PRETTY_NAME' in info:
+        return re.sub(r'\s*\([^)]*\)\s*$', '', name).strip()
+    return f'{name} {version}'.strip()
+
+
+def get_init_stratum() -> str:
+    r = run(['brl', 'deref', 'init'])
+    return r.stdout.strip() if r.returncode == 0 else 'unknown'
+
+
+def detect_pm(stratum: str) -> Optional[str]:
+    pms = ('pacman', 'dnf', 'apt-get', 'zypper', 'xbps-install', 'apk', 'emerge')
+    for pm in pms:
+        for base in ('/usr/bin', '/bin'):
+            if os.path.isfile(f'/bedrock/strata/{stratum}{base}/{pm}'):
+                return pm
+    return None
+
+
+def pkg_count(stratum: str, pm: Optional[str]) -> int:
+    if not pm:
+        return 0
+    cmds = {
+        'pacman':       'pacman -Qq 2>/dev/null | wc -l',
+        'dnf':          'rpm -qa 2>/dev/null | wc -l',
+        'apt-get':      'dpkg-query -W 2>/dev/null | wc -l',
+        'zypper':       'rpm -qa 2>/dev/null | wc -l',
+        'xbps-install': 'xbps-query -l 2>/dev/null | wc -l',
+        'apk':          'apk list -I 2>/dev/null | wc -l',
+        'emerge':       "(qlist -I 2>/dev/null || ls -d /var/db/pkg/*/* 2>/dev/null) | wc -l",
+    }
+    r = run(['strat', stratum, 'sh', '-c', cmds.get(pm, 'true')], timeout=15)
+    try:
+        return int(r.stdout.strip() or '0')
+    except ValueError:
+        return 0
+
+
+def get_disk(path: str = '/') -> str:
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return 'unknown'
+    total = st.f_blocks * st.f_frsize
+    free  = st.f_bavail * st.f_frsize
+    used  = total - free
+    if total <= 0:
+        return 'unknown'
+    pct = used * 100 // total
+    return f'{used / 1024**3:.1f} GiB / {total / 1024**3:.1f} GiB ({pct}%)'
+
+
+def get_strata_info() -> list[tuple[str, Optional[str], int]]:
+    strata = [s.strip() for s in run(['brl', 'list']).stdout.splitlines() if s.strip()]
+    out = []
+    for s in strata:
+        pm = detect_pm(s)
+        out.append((s, pm, pkg_count(s, pm)))
+    return out
+
+
+def get_active_bootloader() -> str:
+    if not shutil.which('efibootmgr'):
+        return 'unknown'
+    r = run(['efibootmgr', '-v'])
+    if r.returncode != 0:
+        return 'unknown'
+    boot_current = next((line.split(':', 1)[1].strip()
+                         for line in r.stdout.splitlines()
+                         if line.startswith('BootCurrent:')), None)
+    if not boot_current:
+        return 'unknown'
+    for line in r.stdout.splitlines():
+        if line.startswith(f'Boot{boot_current}'):
+            low = line.lower()
+            if 'systemd-boot' in low or '\\systemd\\' in low:
+                return 'systemd-boot'
+            if 'grub' in low:
+                return 'GRUB'
+            return 'unknown'
+    return 'unknown'
+
+
+def get_kernel() -> str:
+    return run(['uname', '-r']).stdout.strip() or 'unknown'
+
+
+def get_cpu() -> str:
+    try:
+        model = ''
+        cores = 0
+        with open('/proc/cpuinfo') as f:
+            for line in f:
+                if not model and line.startswith('model name'):
+                    model = line.split(':', 1)[1].strip()
+                if line.startswith('processor'):
+                    cores += 1
+        model = re.sub(r'\s*\b\d+-Core Processor\b', '', model)
+        model = re.sub(r'\s*\bProcessor\b', '', model)
+        model = re.sub(r'\s*\bCPU\b', '', model)
+        model = re.sub(r'\s*@\s*[\d.]+\s*GHz', '', model)
+        model = re.sub(r'\s+', ' ', model).strip()
+        return f'{model} ({cores})' if model else 'unknown'
+    except OSError:
+        return 'unknown'
+
+
+def _clean_gpu_name(s: str) -> str:
+    for noise in (
+        r'\bCorporation\b', r'\bAdvanced Micro Devices, Inc\.\s*',
+        r'\bIntel\s+Corporation\b', r'\[AMD/ATI\]\s*',
+        r'\(rev [0-9a-f]+\)', r'\bInc\.\b',
+    ):
+        s = re.sub(noise, '', s)
+    m = re.search(r'^(\S+).*\[([^\]]+)\]', s)
+    if m:
+        s = f'{m.group(1)} {m.group(2)}'
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+_AMD_IGPU_HINTS = (
+    'Raphael', 'Phoenix', 'Rembrandt', 'Cezanne', 'Renoir', 'Picasso',
+    'Lucienne', 'Granite Ridge', 'Strix', 'Hawk Point',
+)
+
+
+def get_gpu() -> str:
+    """Pick a single primary GPU.
+
+    Priority (lower number wins): NVIDIA > discrete AMD > integrated AMD/Intel
+    > anything else. Matches what most fetch tools default to — on a hybrid
+    laptop or NVIDIA-paired desktop you almost always want the discrete card.
+    """
+    if not shutil.which('lspci'):
+        return 'unknown'
+    r = run(['lspci', '-mm'])
+    if r.returncode != 0:
+        return 'unknown'
+    candidates: list[tuple[int, str]] = []
+    for line in r.stdout.splitlines():
+        if not any(t in line for t in ('"VGA', '"3D', '"Display')):
+            continue
+        fields = re.findall(r'"([^"]*)"', line)
+        if len(fields) < 3:
+            continue
+        vendor, device = fields[1], fields[2]
+        name = _clean_gpu_name(f'{vendor} {device}')
+        v_up = vendor.upper()
+        if 'NVIDIA' in v_up:
+            priority = 0
+        elif 'AMD' in v_up or 'ATI' in v_up or 'ADVANCED MICRO' in v_up:
+            integrated = any(hint in device for hint in _AMD_IGPU_HINTS)
+            priority = 2 if integrated else 1
+        elif 'INTEL' in v_up:
+            priority = 2
+        else:
+            priority = 3
+        candidates.append((priority, name))
+    if not candidates:
+        return 'unknown'
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+
+def get_memory() -> str:
+    try:
+        with open('/proc/meminfo') as f:
+            data = f.read()
+        total = int(re.search(r'MemTotal:\s+(\d+)', data).group(1)) * 1024
+        avail = int(re.search(r'MemAvailable:\s+(\d+)', data).group(1)) * 1024
+        used = total - avail
+        pct = used * 100 // total
+        return f'{used / 1024**3:.1f} GiB / {total / 1024**3:.1f} GiB ({pct}%)'
+    except (OSError, AttributeError, ValueError):
+        return 'unknown'
+
+
+def get_uptime() -> str:
+    try:
+        with open('/proc/uptime') as f:
+            seconds = float(f.read().split()[0])
+    except OSError:
+        return 'unknown'
+    d, rem = divmod(int(seconds), 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    parts = []
+    if d: parts.append(f'{d}d')
+    if h: parts.append(f'{h}h')
+    if m or not parts: parts.append(f'{m}m')
+    return ' '.join(parts)
+
+
+def get_shell() -> str:
+    sh_path = os.environ.get('SHELL', '/bin/sh')
+    name = os.path.basename(sh_path)
+    if name == 'zsh':
+        r = run([sh_path, '--version'])
+        if r.returncode == 0:
+            return r.stdout.split('(', 1)[0].strip()
+    elif name in ('bash',):
+        r = run([sh_path, '--version'])
+        if r.returncode == 0:
+            line = r.stdout.splitlines()[0]
+            m = re.search(r'version (\S+)', line)
+            if m:
+                return f'bash {m.group(1)}'
+    elif name == 'fish':
+        r = run([sh_path, '--version'])
+        if r.returncode == 0:
+            return r.stdout.strip()
+    return name
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Layout
+# ───────────────────────────────────────────────────────────────────────────
+
+LOGO = r"""
+   ______
+   \     \
+    \     \
+     \     \_________
+      \              \
+       \              \
+        \      ___     \
+         \             /
+          \           /
+           \_________/
+"""
+
+LABEL = 'bold cyan'
+ACCENT = 'cyan'
+
+# ───────────────────────────────────────────────────────────────────────────
+# Personas — arrow-key cycle in interactive mode. Each persona pretends to
+# no real Gentoo stratum required.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+ARCH_LOGO = r"""
+      /\
+     /  \
+    /    \
+   /      \
+  /   ,,   \
+ /   |  |   \
+/_-''    ''-_\
+""".rstrip('\n')
+
+FEDORA_LOGO = r"""
+        ,'''''.
+       |   ,.  |
+       |  |  '_'
+  ,....|  |..
+.'  ,_;|   ..'
+|  |   |  |
+|  ',_,'  |
+ '.     ,'
+   '''''
+""".rstrip('\n')
+
+DEBIAN_LOGO = r"""
+  _____
+ /  __ \
+|  /    |
+|  \___-
+-_
+  --_
+""".rstrip('\n')
+
+GENTOO_LOGO = r"""
+    _____
+   /     \
+  /  ___  \
+ |  /   \  |
+ |  \___/  /
+  \       /
+   \_____/
+""".rstrip('\n')
+
+ALPINE_LOGO = r"""
+   /\ /\
+  // \  \
+ //   \  \
+///    \  \
+//      \  \
+         \
+""".rstrip('\n')
+
+CENTOS_LOGO = r"""
+ ____^____
+ |\  |  /|
+ | \ | / |
+<---- ---->
+ | / | \ |
+ |/__|__\|
+     v
+""".rstrip('\n')
+
+DEVUAN_LOGO = r"""
+ ..:::.
+    ..-==-
+        .+#:
+         =@@
+      :+%@#:
+.:=+#@@%*:
+#@@@#=:
+""".rstrip('\n')
+
+OPENSUSE_LOGO = r"""
+  _______
+__|   __ \
+     / .\ \
+     \__/ |
+   _______|
+   \_______
+__________/
+""".rstrip('\n')
+
+UBUNTU_LOGO = r"""
+       ..;,; .,;,.
+    .,lool: .ooooo,
+   ;oo;:    .coool.
+ ....         ''' ,l;
+:oooo,            'oo.
+looooc            :oo'
+ '::'             ,oo:
+   ,.,       .... co,
+    lo:;.   :oooo; .
+     ':ooo; cooooc
+        '''  ''''
+""".rstrip('\n')
+
+VOID_LOGO = r"""
+    ____
+  'pfPfp.%
+//  _._  \\
+UU |===| UU
+\\  ^~^  //
+ `0PpppP'
+   `````
+""".rstrip('\n')
+
+VOID_MUSL_LOGO = r"""
+---\\\\\\\\\\\\-----------------------
+----\\\      \\\----------------------
+-----\\\      \\\---------------------
+------\\\      \\\\\\\\\\\\\\\\\------
+-------\\\                    \\\-----
+--------\\\                    \\\----
+---------\\\        ______      \\\---
+----------\\\                   ///---
+-----------\\\                 ///----
+------------\\\               ///-----
+-------------\\\////////////////------
+""".rstrip('\n')
+
+BEDROCK_LOGO = r"""
+   ______
+   \     \
+    \     \
+     \     \_________
+      \              \
+       \              \
+        \      ___     \
+         \             /
+          \           /
+           \_________/
+""".rstrip()
+
+
+@dataclass
+class Persona:
+    name: str
+    os_name: str
+    hostname: str
+    logo: str
+    color: str
+    stratum: Optional[str] = None
+    fake_pm: Optional[str] = None
+    fake_pkgs: Optional[int] = None
+    fake_kernel_suffix: Optional[str] = None
+    is_bedrock: bool = False
+
+
+def fake_kernel_for(persona: 'Persona', real_kernel: str) -> str:
+    """Rewrite the real kernel string so it looks distro-native.
+
+    Keeps the major.minor.patch (e.g. "7.0.4") so the disguise stays plausible
+    against `uname -r` parity — Bedrock processes really are running on that
+    kernel — but swaps the distro suffix to match the persona.
+    """
+    if persona.is_bedrock or not persona.fake_kernel_suffix:
+        return real_kernel
+    m = re.match(r'(\d+\.\d+(?:\.\d+)?)', real_kernel)
+    base = m.group(1) if m else real_kernel.split('-', 1)[0]
+    sep = '' if persona.fake_kernel_suffix.startswith('_') else '-'
+    return f'{base}{sep}{persona.fake_kernel_suffix}'
+
+
+def _fake_pkg_count(salt: str, lo: int, hi: int) -> int:
+    """Stable per-machine fake count in [lo, hi].
+
+    Real stratum package counts on this Bedrock box are tiny (e.g. arch 889,
+    debian 80) because they were freshly bootstrapped — totally unrealistic
+    for someone's daily-driver distro. Disguises use plausible ranges instead:
+    matches what `fastfetch` would show on a regular install of that distro.
+    """
+    host = os.uname().nodename
+    seed = sum(ord(c) for c in host) * 17 + sum(ord(c) for c in salt) * 31
+    span = hi - lo + 1
+    return lo + (seed % span) if span > 0 else lo
+
+
+PERSONAS: list[Persona] = [
+    Persona(
+        name='Bedrock',
+        os_name='',
+        hostname='',
+        logo=BEDROCK_LOGO,
+        color='cyan',
+        is_bedrock=True,
+    ),
+    Persona(
+        name='Arch',
+        os_name='Arch Linux',
+        hostname='arch',
+        logo=ARCH_LOGO,
+        color='bright_blue',
+        stratum='arch',
+        fake_pm='pacman',
+        fake_pkgs=_fake_pkg_count('arch', 1300, 1600),
+        fake_kernel_suffix='arch1-1',
+    ),
+    Persona(
+        name='Fedora',
+        os_name='Fedora Linux',
+        hostname='fedora',
+        logo=FEDORA_LOGO,
+        color='blue',
+        stratum='fedora',
+        fake_pm='dnf',
+        fake_pkgs=_fake_pkg_count('fedora', 2400, 2900),
+        fake_kernel_suffix='200.fc41.x86_64',
+    ),
+    Persona(
+        name='Debian',
+        os_name='Debian GNU/Linux',
+        hostname='debian',
+        logo=DEBIAN_LOGO,
+        color='red',
+        stratum='debian',
+        fake_pm='dpkg',
+        fake_pkgs=_fake_pkg_count('debian', 2400, 2900),
+        fake_kernel_suffix='1-amd64',
+    ),
+    Persona(
+        name='Gentoo',
+        os_name='Gentoo Linux',
+        hostname='gentoo',
+        logo=GENTOO_LOGO,
+        color='magenta',
+        fake_pm='emerge',
+        fake_pkgs=_fake_pkg_count('gentoo', 1200, 1600),
+        fake_kernel_suffix='gentoo-x86_64',
+    ),
+    Persona(
+        name='Alpine',
+        os_name='Alpine Linux',
+        hostname='alpine',
+        logo=ALPINE_LOGO,
+        color='cyan',
+        fake_pm='apk',
+        fake_pkgs=_fake_pkg_count('alpine', 150, 380),
+        fake_kernel_suffix='0-lts',
+    ),
+    Persona(
+        name='CentOS',
+        os_name='CentOS Stream',
+        hostname='centos',
+        logo=CENTOS_LOGO,
+        color='bright_magenta',
+        fake_pm='dnf',
+        fake_pkgs=_fake_pkg_count('centos', 1500, 2200),
+        fake_kernel_suffix='el10.x86_64',
+    ),
+    Persona(
+        name='Devuan',
+        os_name='Devuan GNU/Linux',
+        hostname='devuan',
+        logo=DEVUAN_LOGO,
+        color='bright_red',
+        fake_pm='dpkg',
+        fake_pkgs=_fake_pkg_count('devuan', 2200, 2700),
+        fake_kernel_suffix='4-amd64',
+    ),
+    Persona(
+        name='openSUSE',
+        os_name='openSUSE Tumbleweed',
+        hostname='opensuse',
+        logo=OPENSUSE_LOGO,
+        color='green',
+        fake_pm='zypper',
+        fake_pkgs=_fake_pkg_count('opensuse', 2500, 3000),
+        fake_kernel_suffix='1-default',
+    ),
+    Persona(
+        name='Ubuntu',
+        os_name='Ubuntu',
+        hostname='ubuntu',
+        logo=UBUNTU_LOGO,
+        color='orange3',
+        fake_pm='dpkg',
+        fake_pkgs=_fake_pkg_count('ubuntu', 1800, 2500),
+        fake_kernel_suffix='25-generic',
+    ),
+    Persona(
+        name='Void',
+        os_name='Void Linux',
+        hostname='void',
+        logo=VOID_LOGO,
+        color='bright_green',
+        fake_pm='xbps',
+        fake_pkgs=_fake_pkg_count('void', 700, 1300),
+        fake_kernel_suffix='_1',
+    ),
+    Persona(
+        name='Void-musl',
+        os_name='Void Linux (musl)',
+        hostname='void',
+        logo=VOID_MUSL_LOGO,
+        color='bright_green',
+        fake_pm='xbps',
+        fake_pkgs=_fake_pkg_count('void-musl', 700, 1300),
+        fake_kernel_suffix='_1',
+    ),
+]
+
+
+def _print_logo_info(logo_lines: list[str], info: 'Table', color: str):
+    """Render logo + info side-by-side, falling back to stacked layout when
+    the terminal isn't wide enough to fit both without wrapping info values.
+    Re-queries console.width each call so successive invocations adapt to
+    terminal resizes."""
+    logo_w = max((len(line) for line in logo_lines), default=0)
+    info_min = console.measure(info).minimum
+    width = console.width
+    side_by_side = width >= logo_w + info_min + 4
+
+    if side_by_side:
+        logo = Text('\n'.join(logo_lines), style=f'bold {color}')
+        layout = Table.grid(padding=(0, 1))
+        layout.add_column(no_wrap=True)
+        layout.add_column()
+        layout.add_row(logo, info)
+        console.print(layout)
+        return
+
+    logo = Text('\n'.join(logo_lines), style=f'bold {color}')
+    console.print(Align.center(logo))
+    console.print(Align.center(info))
+
+
+def render(persona: Persona):
+    user = os.environ.get('USER', '?')
+    real_host = run(['hostname']).stdout.strip() or '?'
+    hostname = real_host if persona.is_bedrock else persona.hostname
+    label_color = persona.color
+    accent = persona.color
+
+    bedrock_ver = get_bedrock_version()
+    kernel      = fake_kernel_for(persona, get_kernel())
+    uptime      = get_uptime()
+    bootloader  = get_active_bootloader()
+    cpu         = get_cpu()
+    gpu         = get_gpu()
+    mem         = get_memory()
+
+    info = Table.grid(padding=(0, 2))
+    info.add_column(style=f'bold {label_color}', justify='right', no_wrap=True)
+    info.add_column(overflow='fold')
+
+    header = (f'[bold {label_color}]{user}[/bold {label_color}]'
+              f'[dim]@[/dim][bold {label_color}]{hostname}[/bold {label_color}]')
+    sep_len = len(user) + 1 + len(hostname)
+    info.add_row('', header)
+    info.add_row('', '─' * sep_len)
+
+    if persona.is_bedrock:
+        info.add_row('OS', bedrock_ver)
+        info.add_row('Hijacked from', get_hijacked_from())
+        info.add_row('Host (init)', get_init_stratum())
+    else:
+        info.add_row('OS', persona.os_name)
+
+    info.add_row('Kernel', kernel)
+    info.add_row('Uptime', uptime)
+    info.add_row('Bootloader', bootloader)
+    info.add_row('CPU', cpu)
+    info.add_row('GPU', gpu)
+    info.add_row('Memory', mem)
+    info.add_row('Disk (/)', get_disk('/'))
+    info.add_row('', '')
+
+    if persona.is_bedrock:
+        strata = get_strata_info()
+        info.add_row('Strata', f'[dim]({len(strata)})[/dim]')
+        pm_width = max((len(pm) for _, pm, _ in strata if pm), default=4)
+        for name, pm, cnt in strata:
+            if pm is None:
+                right = '[dim](meta)[/dim]'
+            else:
+                right = f'[dim]{pm:<{pm_width}}[/dim]  {cnt:>5} pkg'
+            info.add_row(f'  [{accent}]·[/{accent}] {name}', right)
+    else:
+        info.add_row('Packages', f'{persona.fake_pkgs} ({persona.fake_pm})')
+
+    logo_lines = persona.logo.strip('\n').splitlines()
+    _print_logo_info(logo_lines, info, persona.color)
+
+
+MINIMAL_LOGO = r"""
+ __
+ \ \___
+  \  _ \
+   \___/
+""".rstrip('\n')
+
+
+def render_minimal():
+    """Compact view for shell startup: 5 fields + tiny logo."""
+    user = os.environ.get('USER', '?')
+    real_host = run(['hostname']).stdout.strip() or '?'
+
+    info = Table.grid(padding=(0, 2))
+    info.add_column(style='bold cyan', justify='right', no_wrap=True)
+    info.add_column(overflow='fold')
+
+    header = (f'[bold cyan]{user}[/bold cyan]'
+              f'[dim]@[/dim][bold cyan]{real_host}[/bold cyan]')
+    sep_len = len(user) + 1 + len(real_host)
+    info.add_row('', header)
+    info.add_row('', '─' * sep_len)
+    info.add_row('Hijacked', get_hijacked_from())
+    info.add_row('Kernel',   get_kernel())
+    info.add_row('Uptime',   get_uptime())
+    info.add_row('Memory',   get_memory())
+    info.add_row('Shell',    get_shell())
+
+    logo_lines = MINIMAL_LOGO.strip('\n').splitlines()
+    _print_logo_info(logo_lines, info, 'cyan')
+
+
+def disguise_command_line(replacement: str = 'fastfetch'):
+    """Overwrite the previous terminal line (the user's `brlfetch <persona>`
+    command) with `<prompt> fastfetch`, so anyone looking at the scrollback
+    sees what looks like a plain fastfetch invocation. Best-effort: requires
+    a TTY and an oh-my-zsh-style prompt to look natural.
+    """
+    if not sys.stdout.isatty():
+        return
+    prompt = '\x1b[1;32m➜\x1b[0m  \x1b[36m~\x1b[0m '
+    sys.stdout.write('\x1b[A\r\x1b[2K' + prompt + replacement + '\n')
+    sys.stdout.flush()
+
+
+def emit_json():
+    """Machine-readable dump of the same fields the full view shows."""
+    import json
+    strata = []
+    for name, pm, cnt in get_strata_info():
+        strata.append({
+            'name': name,
+            'pm': pm,
+            'packages': cnt,
+            'is_meta': pm is None,
+        })
+    try:
+        st = os.statvfs('/')
+        disk_total = st.f_blocks * st.f_frsize
+        disk_free  = st.f_bavail * st.f_frsize
+    except OSError:
+        disk_total = disk_free = 0
+    data = {
+        'user': os.environ.get('USER', '?'),
+        'hostname': run(['hostname']).stdout.strip() or '?',
+        'bedrock_version': get_bedrock_version(),
+        'hijacked_from': get_hijacked_from(),
+        'init_stratum': get_init_stratum(),
+        'kernel': get_kernel(),
+        'uptime_seconds': int(float(open('/proc/uptime').read().split()[0]))
+            if os.path.exists('/proc/uptime') else 0,
+        'bootloader': get_active_bootloader(),
+        'cpu': get_cpu(),
+        'gpu': get_gpu(),
+        'memory': get_memory(),
+        'shell': get_shell(),
+        'disk_root_bytes_total': disk_total,
+        'disk_root_bytes_used': disk_total - disk_free,
+        'strata': strata,
+    }
+    print(json.dumps(data, indent=2))
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog='brlfetch',
+        description='Bedrock Linux fetch tool.',
+    )
+    ap.add_argument('persona', nargs='?', help=argparse.SUPPRESS)
+    ap.add_argument('-m', '--minimal', action='store_true',
+                    help='compact 5-field view for shell startup')
+    ap.add_argument('-j', '--json', action='store_true',
+                    help='emit machine-readable JSON instead of the TUI panel')
+    ap.add_argument('--no-disguise', action='store_true',
+                    help='do not rewrite the command line when invoking a persona')
+    ap.add_argument('--run_test', action='store_true', help=argparse.SUPPRESS)
+    args = ap.parse_args()
+
+    if args.run_test:
+        bail()
+    verify_bedrock()
+
+    if args.json:
+        emit_json()
+        return
+
+    if args.minimal:
+        render_minimal()
+        return
+
+    chosen = PERSONAS[0]
+    matched = False
+    if args.persona:
+        want = args.persona.lower()
+        for p in PERSONAS:
+            if p.name.lower() == want:
+                chosen = p
+                matched = True
+                break
+    if matched and not chosen.is_bedrock and not args.no_disguise:
+        disguise_command_line()
+    render(chosen)
+
+
+if __name__ == '__main__':
+    main()

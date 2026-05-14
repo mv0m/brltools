@@ -1,0 +1,644 @@
+#!/usr/bin/env python3
+"""brlmon — Bedrock-aware process monitor (htop with a stratum column)."""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import os
+import select
+import shutil
+import subprocess
+import sys
+import termios
+import time
+import tty
+from collections import namedtuple
+
+try:
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+except ImportError:
+    sys.stderr.write(
+        "brlmon needs python-rich. Install via your distro pm:\n"
+        "  arch: python-rich   fedora/debian: python3-rich   any: pip install --user rich\n"
+    )
+    sys.exit(1)
+
+console = Console()
+
+CLK_TCK = os.sysconf(os.sysconf_names['SC_CLK_TCK'])
+
+STRATUM_COLORS = {
+    'arch':    'cyan',
+    'fedora':  'bright_blue',
+    'debian':  'red',
+    'ubuntu':  'orange3',
+    'gentoo':  'magenta',
+    'void':    'green',
+    'alpine':  'bright_cyan',
+    'bedrock': 'yellow',
+    'kernel':  'bright_black',
+    '?':       'red',
+}
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Bedrock detection — same 5-signal pattern as brldoc / brlfetch
+# ───────────────────────────────────────────────────────────────────────────
+
+def run(cmd, timeout=5):
+    try:
+        return subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        class R:
+            returncode = 124
+            stdout = ''
+            stderr = ''
+        return R()
+
+
+def bail():
+    console.print(Panel.fit(
+        "[bold red]Theres nothing hijacked yet, no processes for me to watch.[/bold red]\n"
+        "[dim](brlmon is for Bedrock Linux systems only — see https://bedrocklinux.org)[/dim]",
+        border_style='red',
+    ))
+    sys.exit(2)
+
+
+def verify_bedrock():
+    signals = [
+        os.path.isdir('/bedrock'),
+        os.path.isdir('/bedrock/cross'),
+        shutil.which('brl') is not None,
+    ]
+    if signals[-1]:
+        r = run(['brl', 'version'], timeout=3)
+        signals.append(r.returncode == 0 and 'Bedrock' in r.stdout)
+        signals.append(bool(run(['brl', 'list'], timeout=3).stdout.strip()))
+    if not all(signals):
+        bail()
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# /proc parsing
+# ───────────────────────────────────────────────────────────────────────────
+
+Proc = namedtuple('Proc', 'pid name stratum cpu_jiffies rss user state cmdline')
+
+_user_cache = {}
+def username_for_uid(uid):
+    if uid in _user_cache:
+        return _user_cache[uid]
+    try:
+        import pwd
+        name = pwd.getpwuid(uid).pw_name
+    except (KeyError, ImportError):
+        name = str(uid)
+    _user_cache[uid] = name
+    return name
+
+
+def read_cpu_times():
+    """Returns (total_ticks, idle_ticks) from /proc/stat.
+
+    btop and htop both normalize per-process CPU% against the change in
+    /proc/stat's aggregate ticks rather than wall-clock seconds — that
+    cancels out drift, GC pauses, and the inevitable jitter between when
+    we read /proc/<pid>/stat and when we compute elapsed time.
+    """
+    try:
+        with open('/proc/stat') as f:
+            parts = f.readline().split()
+        vals = [int(x) for x in parts[1:]]
+        total = sum(vals)
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        return total, idle
+    except (OSError, ValueError):
+        return 0, 0
+
+
+def read_total_memory_kb():
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return 1
+
+
+_stratum_cache = {}
+
+def _stratum_from_mountinfo(pid):
+    """Read /proc/<pid>/mountinfo and pull the stratum out of the '/' mount's
+    source-root field. Bedrock mounts a stratum-specific subtree at '/' for
+    non-init strata; the field looks like '/root/bedrock/strata/<name>' (or
+    '/bedrock/strata/<name>' depending on subvolume layout). For init-stratum
+    and global processes the source-root has no '/bedrock/strata/' segment —
+    those count as the init stratum ('bedrock' for purposes of this tool, but
+    the actual init stratum name is resolved once below).
+    """
+    try:
+        with open(f'/proc/{pid}/mountinfo') as f:
+            data = f.read()
+    except (OSError, PermissionError):
+        return None
+    if not data:
+        return None
+    for line in data.splitlines():
+        fields = line.split()
+        if len(fields) < 5:
+            continue
+        if fields[4] != '/':
+            continue
+        root_path = fields[3]
+        marker = '/bedrock/strata/'
+        idx = root_path.find(marker)
+        if idx >= 0:
+            rest = root_path[idx + len(marker):]
+            name = rest.split('/', 1)[0]
+            if name:
+                return name
+        return _INIT_STRATUM
+    return None
+
+
+def _init_stratum():
+    r = run(['brl', 'deref', 'init'], timeout=3)
+    name = r.stdout.strip()
+    return name or 'bedrock'
+
+
+_INIT_STRATUM = 'bedrock'
+
+
+def _ppid_of(pid):
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            stat = f.read()
+        r = stat.rfind(')')
+        rest = stat[r + 2:].split()
+        return int(rest[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def stratum_of(pid, _seen=None):
+    if pid in _stratum_cache:
+        return _stratum_cache[pid]
+    if _seen is None:
+        _seen = set()
+    if pid in _seen or pid <= 0:
+        return 'bedrock'
+    _seen.add(pid)
+
+    bedrock_helper = False
+    try:
+        exe = os.readlink(f'/proc/{pid}/exe')
+        if exe.startswith('/bedrock/') and not exe.startswith('/bedrock/strata/'):
+            bedrock_helper = True
+    except (OSError, PermissionError):
+        pass
+    if not bedrock_helper:
+        try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                first = f.read().split(b'\x00', 1)[0].decode('utf-8', errors='replace')
+            if first.startswith('/bedrock/') and not first.startswith('/bedrock/strata/'):
+                bedrock_helper = True
+        except OSError:
+            pass
+    if bedrock_helper:
+        _stratum_cache[pid] = 'bedrock'
+        return 'bedrock'
+
+    result = _stratum_from_mountinfo(pid)
+    if result is None:
+        ppid = _ppid_of(pid)
+        if ppid and ppid != pid:
+            result = stratum_of(ppid, _seen)
+        else:
+            result = 'bedrock'
+
+    _stratum_cache[pid] = result
+    return result
+
+
+def scan_processes(show_kernel=True):
+    procs = []
+    for entry in os.scandir('/proc'):
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            with open(f'/proc/{pid}/stat') as f:
+                stat = f.read()
+            l = stat.find('(')
+            r = stat.rfind(')')
+            comm = stat[l + 1:r]
+            rest = stat[r + 2:].split()
+            state = rest[0]
+            utime = int(rest[11])
+            stime = int(rest[12])
+            cpu_jiffies = utime + stime
+
+            rss = 0
+            uid = 0
+            with open(f'/proc/{pid}/status') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        rss = int(line.split()[1])
+                    elif line.startswith('Uid:'):
+                        uid = int(line.split()[1])
+
+            try:
+                with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                    raw = f.read()
+            except OSError:
+                raw = b''
+            cmdline = raw.replace(b'\x00', b' ').strip().decode('utf-8', errors='replace')
+
+            is_kernel = False
+            if not cmdline:
+                try:
+                    exe_link = os.readlink(f'/proc/{pid}/exe')
+                    is_kernel = not exe_link
+                except (OSError, PermissionError):
+                    is_kernel = True
+                cmdline = f'[{comm}]'
+
+            stratum = 'kernel' if is_kernel else stratum_of(pid)
+            if stratum == 'kernel' and not show_kernel:
+                continue
+
+            procs.append(Proc(
+                pid=pid,
+                name=comm,
+                stratum=stratum,
+                cpu_jiffies=cpu_jiffies,
+                rss=rss,
+                user=username_for_uid(uid),
+                state=state,
+                cmdline=cmdline,
+            ))
+        except (OSError, ValueError, IndexError):
+            continue
+    return procs
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Raw stdin for live keybinds
+# ───────────────────────────────────────────────────────────────────────────
+
+_old_termios = None
+
+def install_raw_stdin():
+    global _old_termios
+    if not sys.stdin.isatty():
+        return
+    fd = sys.stdin.fileno()
+    _old_termios = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    atexit.register(restore_stdin)
+
+
+def restore_stdin():
+    global _old_termios
+    if _old_termios is not None and sys.stdin.isatty():
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _old_termios)
+        _old_termios = None
+
+
+_ESC_MAP = {
+    b'\x1b[A': 'UP',    b'\x1b[B': 'DOWN',
+    b'\x1b[C': 'RIGHT', b'\x1b[D': 'LEFT',
+    b'\x1b[5~': 'PGUP', b'\x1b[6~': 'PGDN',
+    b'\x1b[H': 'HOME',  b'\x1b[F': 'END',
+    b'\x1bOH': 'HOME',  b'\x1bOF': 'END',
+}
+
+
+def read_key(timeout):
+    if not sys.stdin.isatty():
+        time.sleep(timeout)
+        return None
+    fd = sys.stdin.fileno()
+    r, _, _ = select.select([fd], [], [], timeout)
+    if not r:
+        return None
+    try:
+        data = os.read(fd, 1)
+    except OSError:
+        return None
+    if not data:
+        return None
+    if data == b'\x1b':
+        seq = data
+        for _ in range(5):
+            r, _, _ = select.select([fd], [], [], 0.03)
+            if not r:
+                break
+            try:
+                more = os.read(fd, 1)
+            except OSError:
+                break
+            if not more:
+                break
+            seq += more
+            if more in b'ABCDHF~':
+                break
+        return _ESC_MAP.get(seq, 'ESC')
+    return data.decode('utf-8', errors='replace')
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Rendering
+# ───────────────────────────────────────────────────────────────────────────
+
+def fmt_mem_kb(kb):
+    if kb >= 1024 * 1024:
+        return f"{kb / 1024 / 1024:.1f}G"
+    if kb >= 1024:
+        return f"{kb / 1024:.0f}M"
+    return f"{kb}K"
+
+
+def stratum_cell(name):
+    color = STRATUM_COLORS.get(name, 'white')
+    return Text(name, style=color)
+
+
+SORT_KEYS = {
+    'cpu':     (lambda x: x[1],                  True),
+    'mem':     (lambda x: x[0].rss,              True),
+    'time':    (lambda x: x[0].cpu_jiffies,      True),
+    'pid':     (lambda x: x[0].pid,              False),
+    'name':    (lambda x: x[0].name.lower(),     False),
+    'stratum': (lambda x: x[0].stratum,          False),
+    'user':    (lambda x: x[0].user,             False),
+}
+
+
+def build_table(procs_with_cpu, total_mem_kb, sort_by, reverse, scroll, view_n):
+    table = Table(
+        header_style='bold cyan',
+        show_lines=False,
+        expand=True,
+        pad_edge=False,
+        box=None,
+        padding=(0, 1),
+    )
+    table.add_column('PID', justify='right', min_width=6, no_wrap=True)
+    table.add_column('USER', min_width=8, no_wrap=True)
+    table.add_column('STRATUM', min_width=8, no_wrap=True)
+    table.add_column('CPU%', justify='right', min_width=5, no_wrap=True)
+    table.add_column('MEM%', justify='right', min_width=5, no_wrap=True)
+    table.add_column('RSS', justify='right', min_width=6, no_wrap=True)
+    table.add_column('S', min_width=1, no_wrap=True)
+    table.add_column('COMMAND', overflow='ellipsis', no_wrap=True, ratio=1)
+
+    key_fn, _ = SORT_KEYS.get(sort_by, SORT_KEYS['cpu'])
+    procs_with_cpu.sort(key=key_fn, reverse=reverse)
+
+    visible = procs_with_cpu[scroll:scroll + view_n]
+    for proc, cpu_pct in visible:
+        mem_pct = (proc.rss / total_mem_kb * 100) if total_mem_kb else 0
+        cpu_color = 'red' if cpu_pct > 50 else ('yellow' if cpu_pct > 10 else 'white')
+        mem_color = 'red' if mem_pct > 20 else ('yellow' if mem_pct > 5 else 'white')
+        state_color = 'red' if proc.state == 'D' else ('yellow' if proc.state == 'Z' else 'dim')
+        row_dim = proc.stratum == 'kernel'
+        table.add_row(
+            Text(str(proc.pid), style='dim' if row_dim else 'white'),
+            Text(proc.user, style='dim' if row_dim else 'white'),
+            stratum_cell(proc.stratum),
+            Text(f'{cpu_pct:.1f}', style=cpu_color),
+            Text(f'{mem_pct:.1f}', style=mem_color),
+            Text(fmt_mem_kb(proc.rss), style='dim' if row_dim else 'white'),
+            Text(proc.state, style=state_color),
+            Text(proc.cmdline or proc.name, style='dim' if row_dim else 'white'),
+        )
+    return table
+
+
+def build_header(procs_with_cpu, system_cpu, total_mem_kb, used_mem_kb,
+                  paused, filter_stratum, scroll, view_n, ncpu):
+    strata_counts: dict[str, int] = {}
+    strata_cpu: dict[str, float] = {}
+    for proc, cpu_pct in procs_with_cpu:
+        strata_counts[proc.stratum] = strata_counts.get(proc.stratum, 0) + 1
+        strata_cpu[proc.stratum] = strata_cpu.get(proc.stratum, 0.0) + cpu_pct
+    chips = []
+    for strat, cnt in sorted(strata_counts.items(), key=lambda x: (-x[1], x[0])):
+        col = STRATUM_COLORS.get(strat, 'white')
+        cpu = strata_cpu.get(strat, 0.0)
+        chips.append(f"[{col}]●[/{col}] [bold]{strat}[/bold] [dim]{cnt}[/dim] "
+                     f"[dim]({cpu:.1f}%)[/dim]")
+    chip_str = "  ".join(chips)
+
+    mem_pct = used_mem_kb / total_mem_kb * 100 if total_mem_kb else 0
+    cpu_color = 'red' if system_cpu > 80 else ('yellow' if system_cpu > 40 else 'green')
+    mem_color = 'red' if mem_pct > 80 else ('yellow' if mem_pct > 60 else 'green')
+    nshown = len(procs_with_cpu)
+    end = min(nshown, scroll + view_n)
+    parts = [
+        "[bold cyan]brlmon[/bold cyan]",
+        f"[dim]procs[/dim] [bold]{nshown}[/bold]",
+        f"[dim]cpu[/dim] [bold {cpu_color}]{system_cpu:5.1f}%[/bold {cpu_color}] [dim]({ncpu}c)[/dim]",
+        f"[dim]mem[/dim] [bold {mem_color}]{fmt_mem_kb(used_mem_kb)}[/bold {mem_color}]/[dim]{fmt_mem_kb(total_mem_kb)}[/dim]",
+        f"[dim]view[/dim] [bold]{scroll + 1}-{end}[/bold]/[dim]{nshown}[/dim]",
+    ]
+    if filter_stratum:
+        parts.append(f"[dim]filter[/dim] [bold yellow]{filter_stratum}[/bold yellow]")
+    if paused:
+        parts.append("[bold black on yellow] PAUSED [/bold black on yellow]")
+    top = "  [dim]│[/dim]  ".join(parts)
+    return Text.from_markup(top + "\n" + chip_str)
+
+
+def build_footer(sort_by, reverse, filter_stratum):
+    arrow = '↓' if reverse else '↑'
+    flt = (f"  [dim]filter[/dim] [bold yellow]{filter_stratum}[/bold yellow]"
+           if filter_stratum else '')
+    return Text.from_markup(
+        f"[dim]sort[/dim] [bold]{sort_by}{arrow}[/bold]{flt}   "
+        "[bold]↑↓[/bold] scroll  [bold]PgUp/Dn[/bold] page  [bold]g/G[/bold] top/end  "
+        "[bold]c[/bold]/[bold]m[/bold]/[bold]t[/bold]/[bold]p[/bold]/[bold]n[/bold]/[bold]s[/bold]/[bold]u[/bold] sort  "
+        "[bold]r[/bold] rev  [bold]f[/bold] cycle-strat  [bold]␣[/bold] pause  "
+        "[bold]k[/bold] kern  [bold]q[/bold] quit"
+    )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Main loop
+# ───────────────────────────────────────────────────────────────────────────
+
+def used_memory_kb(total):
+    try:
+        avail = total
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    avail = int(line.split()[1])
+                    break
+        return max(0, total - avail)
+    except OSError:
+        return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog='brlmon',
+        description='Bedrock-aware process monitor — htop with a stratum column.',
+    )
+    ap.add_argument('-i', '--interval', type=float, default=1.5,
+                    help='Refresh interval in seconds (default: 1.5)')
+    ap.add_argument('-s', '--sort', choices=list(SORT_KEYS), default='cpu',
+                    help='Initial sort column (default: cpu)')
+    ap.add_argument('-n', '--limit', type=int, default=0,
+                    help='Cap shown processes (0 = auto-fit terminal)')
+    ap.add_argument('-f', '--filter', metavar='STRATUM',
+                    help='Only show processes from this stratum')
+    ap.add_argument('--no-kernel', action='store_true',
+                    help='Hide kernel threads at start (toggle with k)')
+    ap.add_argument('--run_test', action='store_true', help=argparse.SUPPRESS)
+    args = ap.parse_args()
+
+    if args.run_test:
+        bail()
+    verify_bedrock()
+
+    global _INIT_STRATUM
+    _INIT_STRATUM = _init_stratum()
+
+    install_raw_stdin()
+
+    sort_by = args.sort
+    _, default_reverse = SORT_KEYS[sort_by]
+    reverse = default_reverse
+    paused = False
+    show_kernel = not args.no_kernel
+    filter_stratum = args.filter
+    scroll = 0
+    ncpu = os.cpu_count() or 1
+
+    total_mem = read_total_memory_kb()
+    prev_total_ticks, prev_idle_ticks = read_cpu_times()
+    prev_jiffies = {p.pid: p.cpu_jiffies for p in scan_processes(show_kernel)}
+    time.sleep(0.25)
+
+    procs_all: list = []
+    procs_visible: list = []
+    system_cpu = 0.0
+
+    def reset_baseline():
+        nonlocal prev_total_ticks, prev_idle_ticks, prev_jiffies
+        prev_total_ticks, prev_idle_ticks = read_cpu_times()
+        prev_jiffies = {p.pid: p.cpu_jiffies for p in scan_processes(show_kernel)}
+
+    try:
+        with Live(console=console, screen=True, refresh_per_second=15,
+                  transient=False, auto_refresh=False) as live:
+            while True:
+                if not paused:
+                    total_ticks, idle_ticks = read_cpu_times()
+                    delta_total = max(1, total_ticks - prev_total_ticks)
+                    delta_idle = max(0, idle_ticks - prev_idle_ticks)
+                    procs = scan_processes(show_kernel)
+
+                    procs_all = []
+                    new_jiffies = {}
+                    for p in procs:
+                        prev = prev_jiffies.get(p.pid, p.cpu_jiffies)
+                        delta = max(0, p.cpu_jiffies - prev)
+                        cpu_pct = 100.0 * delta * ncpu / delta_total
+                        procs_all.append((p, cpu_pct))
+                        new_jiffies[p.pid] = p.cpu_jiffies
+                    prev_jiffies = new_jiffies
+                    prev_total_ticks = total_ticks
+                    prev_idle_ticks = idle_ticks
+                    system_cpu = 100.0 * (delta_total - delta_idle) / delta_total
+
+                if filter_stratum:
+                    procs_visible = [(p, c) for p, c in procs_all
+                                     if p.stratum == filter_stratum]
+                else:
+                    procs_visible = list(procs_all)
+
+                used_mem = used_memory_kb(total_mem)
+                term_h = console.size.height
+                view_n = args.limit if args.limit else max(5, term_h - 6)
+
+                max_scroll = max(0, len(procs_visible) - view_n)
+                if scroll > max_scroll:
+                    scroll = max_scroll
+
+                table = build_table(procs_visible, total_mem, sort_by,
+                                    reverse, scroll, view_n)
+                header = build_header(procs_all, system_cpu, total_mem,
+                                       used_mem, paused, filter_stratum,
+                                       scroll, view_n, ncpu)
+                footer = build_footer(sort_by, reverse, filter_stratum)
+
+                live.update(Group(header, Text(''), table, Text(''), footer),
+                            refresh=True)
+
+                key = read_key(args.interval)
+                if key is None:
+                    continue
+                if key in ('q', 'Q', '\x03', '\x04'):
+                    break
+                if key == 'c':
+                    sort_by, reverse, scroll = 'cpu', True, 0
+                elif key == 'm':
+                    sort_by, reverse, scroll = 'mem', True, 0
+                elif key == 't':
+                    sort_by, reverse, scroll = 'time', True, 0
+                elif key == 'p':
+                    sort_by, reverse, scroll = 'pid', False, 0
+                elif key == 'n':
+                    sort_by, reverse, scroll = 'name', False, 0
+                elif key == 's':
+                    sort_by, reverse, scroll = 'stratum', False, 0
+                elif key == 'u':
+                    sort_by, reverse, scroll = 'user', False, 0
+                elif key == 'r':
+                    reverse, scroll = not reverse, 0
+                elif key == 'f':
+                    strata_present = sorted({p.stratum for p, _ in procs_all})
+                    cycle = [None] + strata_present
+                    try:
+                        idx = cycle.index(filter_stratum)
+                    except ValueError:
+                        idx = 0
+                    filter_stratum = cycle[(idx + 1) % len(cycle)]
+                    scroll = 0
+                elif key == ' ':
+                    paused = not paused
+                elif key == 'k':
+                    show_kernel = not show_kernel
+                    reset_baseline()
+                elif key == 'UP':
+                    scroll = max(0, scroll - 1)
+                elif key == 'DOWN':
+                    scroll = min(max_scroll, scroll + 1)
+                elif key == 'PGUP':
+                    scroll = max(0, scroll - view_n)
+                elif key == 'PGDN':
+                    scroll = min(max_scroll, scroll + view_n)
+                elif key in ('g', 'HOME'):
+                    scroll = 0
+                elif key in ('G', 'END'):
+                    scroll = max_scroll
+    except KeyboardInterrupt:
+        pass
+    finally:
+        restore_stdin()
+
+
+if __name__ == '__main__':
+    main()

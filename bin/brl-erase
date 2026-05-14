@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""brl-erase — fuzzy cross-stratum package removal.
+
+Search every stratum's package manager for an installed package whose name
+contains the given pattern (case-insensitive), show what was found, and offer
+to remove all matches. Kernel/boot-adjacent matches force a 3-step confirm.
+
+Usage:
+    brl-erase chrome             # delete every chrome* package, any stratum
+    brl-erase firefox -y         # skip the first confirm, still triple-confirms danger
+    brl-erase --regex '^vim'     # full-regex match
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+from collections import OrderedDict
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich.prompt import Confirm
+except ImportError:
+    sys.stderr.write(
+        "brl-erase needs python-rich. Install via your distro pm:\n"
+        "  arch: python-rich   fedora/debian: python3-rich   any: pip install --user rich\n"
+    )
+    sys.exit(1)
+
+console = Console()
+
+META_STRATA = {'bedrock', 'init'}
+
+DANGEROUS_PATTERNS = [
+    (re.compile(r'^linux($|-)'),               'kernel package'),
+    (re.compile(r'^kernel($|-)'),              'kernel package'),
+    (re.compile(r'^grub'),                     'bootloader'),
+    (re.compile(r'systemd-boot'),              'bootloader'),
+    (re.compile(r'^efibootmgr$'),              'bootloader tool'),
+    (re.compile(r'^bootctl$'),                 'bootloader tool'),
+    (re.compile(r'^(dracut|mkinitcpio)$'),     'initramfs builder'),
+    (re.compile(r'initramfs'),                 'initramfs'),
+    (re.compile(r'^(linux-firmware|firmware-)'), 'kernel firmware'),
+    (re.compile(r'^(glibc|libc6|musl)$'),      'libc'),
+    (re.compile(r'^systemd$'),                 'init system'),
+    (re.compile(r'^(pam|libpam)$'),            'auth (PAM)'),
+    (re.compile(r'^(bash|sh|dash|ash)$'),      'system shell'),
+    (re.compile(r'^(coreutils|util-linux|busybox)$'), 'core utilities'),
+    (re.compile(r'^udev$'),                    'device manager'),
+    (re.compile(r'^shadow$|shadow-utils'),     'auth (shadow)'),
+]
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Bedrock detection
+# ───────────────────────────────────────────────────────────────────────────
+
+def run(cmd, timeout=15, **kw):
+    kw.setdefault('stdout', subprocess.PIPE)
+    kw.setdefault('stderr', subprocess.PIPE)
+    kw.setdefault('text', True)
+    try:
+        return subprocess.run(cmd, timeout=timeout, **kw)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        class R:
+            returncode = 124
+            stdout = ''
+            stderr = ''
+        return R()
+
+
+def bail():
+    console.print(Panel.fit(
+        "[bold red]Theres nothing hijacked yet, nothing for me to erase.[/bold red]\n"
+        "[dim](brl-erase is for Bedrock Linux systems only — see https://bedrocklinux.org)[/dim]",
+        border_style='red',
+    ))
+    sys.exit(2)
+
+
+def verify_bedrock():
+    signals = [
+        os.path.isdir('/bedrock'),
+        os.path.isdir('/bedrock/cross'),
+        shutil.which('brl') is not None,
+    ]
+    if signals[-1]:
+        r = run(['brl', 'version'], timeout=3)
+        signals.append(r.returncode == 0 and 'Bedrock' in r.stdout)
+        signals.append(bool(run(['brl', 'list'], timeout=3).stdout.strip()))
+    if not all(signals):
+        bail()
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Stratum + package manager
+# ───────────────────────────────────────────────────────────────────────────
+
+def list_strata() -> list[str]:
+    r = run(['brl', 'list'], timeout=5)
+    if r.returncode != 0:
+        return []
+    return [l.strip() for l in r.stdout.splitlines() if l.strip()]
+
+
+def detect_pm(stratum: str) -> str:
+    """Probe binaries in the stratum to determine its package manager."""
+    candidates = [
+        ('pacman',     'pacman'),
+        ('dnf',        'dnf'),
+        ('apt-get',    'apt-get'),
+        ('apk',        'apk'),
+        ('xbps-query', 'xbps'),
+        ('zypper',     'zypper'),
+        ('emerge',     'emerge'),
+    ]
+    for binary, pm in candidates:
+        if os.path.exists(f'/bedrock/strata/{stratum}/usr/bin/{binary}'):
+            return pm
+    if os.path.isdir(f'/bedrock/strata/{stratum}/var/db/pkg'):
+        return 'emerge'
+    return ''
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Search
+# ───────────────────────────────────────────────────────────────────────────
+
+def _matcher(pattern: str, use_regex: bool):
+    if use_regex:
+        rx = re.compile(pattern, re.IGNORECASE)
+        return lambda s: bool(rx.search(s))
+    needle = pattern.lower()
+    return lambda s: needle in s.lower()
+
+
+def search_stratum(stratum: str, pm: str, match) -> list[str]:
+    """Return installed package names in <stratum> that match the predicate."""
+    pkgs: list[str] = []
+    if pm == 'pacman':
+        r = run(['strat', stratum, 'pacman', '-Qq'], timeout=15)
+        if r.returncode == 0:
+            pkgs = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    elif pm == 'dnf':
+        r = run(['strat', stratum, 'rpm', '-qa', '--queryformat', '%{NAME}\n'],
+                timeout=20)
+        if r.returncode == 0:
+            pkgs = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    elif pm in ('apt', 'apt-get'):
+        r = run(['strat', stratum, 'dpkg-query', '-W', '-f=${Package}\n'],
+                timeout=20)
+        if r.returncode == 0:
+            pkgs = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    elif pm == 'apk':
+        r = run(['strat', stratum, 'apk', 'info'], timeout=15)
+        if r.returncode == 0:
+            pkgs = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    elif pm == 'xbps':
+        r = run(['strat', stratum, 'xbps-query', '-l'], timeout=15)
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                parts = line.split(None, 2)
+                if len(parts) < 2:
+                    continue
+                name_ver = parts[1]
+                name = re.sub(r'-[^-]+$', '', name_ver)
+                if name:
+                    pkgs.append(name)
+    elif pm == 'zypper':
+        r = run(['strat', stratum, 'rpm', '-qa', '--queryformat', '%{NAME}\n'],
+                timeout=20)
+        if r.returncode == 0:
+            pkgs = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    elif pm == 'emerge':
+        r = run(['strat', stratum, 'qlist', '-I'], timeout=15)
+        if r.returncode == 0 and r.stdout.strip():
+            pkgs = [l.strip().split('/', 1)[-1] for l in r.stdout.splitlines() if l.strip()]
+        else:
+            db = f'/bedrock/strata/{stratum}/var/db/pkg'
+            if os.path.isdir(db):
+                try:
+                    for cat in os.listdir(db):
+                        cat_dir = os.path.join(db, cat)
+                        if not os.path.isdir(cat_dir):
+                            continue
+                        for pkg_ver in os.listdir(cat_dir):
+                            name = re.sub(r'-[0-9].*$', '', pkg_ver)
+                            if name:
+                                pkgs.append(name)
+                except OSError:
+                    pass
+
+    return sorted({p for p in pkgs if match(p)})
+
+
+def search_all(pattern: str, use_regex: bool) -> 'OrderedDict[str, tuple[str, list[str]]]':
+    """Returns {stratum: (pm, [pkg, ...])} for strata that had any matches."""
+    match = _matcher(pattern, use_regex)
+    found: OrderedDict[str, tuple[str, list[str]]] = OrderedDict()
+    for s in list_strata():
+        if s in META_STRATA:
+            continue
+        pm = detect_pm(s)
+        if not pm:
+            continue
+        pkgs = search_stratum(s, pm, match)
+        if pkgs:
+            found[s] = (pm, pkgs)
+    return found
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Danger detection
+# ───────────────────────────────────────────────────────────────────────────
+
+def dangerous_reason(pkg: str) -> str:
+    """Returns a label like 'kernel package' if pkg matches a danger pattern,
+    else empty string."""
+    for rx, label in DANGEROUS_PATTERNS:
+        if rx.search(pkg):
+            return label
+    return ''
+
+
+def collect_dangerous(found) -> list[tuple[str, str, str, str]]:
+    """Returns [(stratum, pm, pkg, reason)] for every dangerous match."""
+    out = []
+    for stratum, (pm, pkgs) in found.items():
+        for pkg in pkgs:
+            reason = dangerous_reason(pkg)
+            if reason:
+                out.append((stratum, pm, pkg, reason))
+    return out
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Removal
+# ───────────────────────────────────────────────────────────────────────────
+
+def remove_cmd(stratum: str, pm: str, pkg: str) -> list[str]:
+    """Build the cascade-aware removal command for this pm."""
+    if pm == 'pacman':
+        return ['strat', stratum, 'pacman', '-Rcs', '--noconfirm', pkg]
+    if pm == 'dnf':
+        return ['strat', stratum, 'dnf', '-y', 'remove', pkg]
+    if pm in ('apt', 'apt-get'):
+        return ['strat', stratum, 'apt-get', '-y', '--auto-remove', 'purge', pkg]
+    if pm == 'apk':
+        return ['strat', stratum, 'apk', 'del', pkg]
+    if pm == 'xbps':
+        return ['strat', stratum, 'xbps-remove', '-Ry', pkg]
+    if pm == 'zypper':
+        return ['strat', stratum, 'zypper', '--non-interactive', 'remove',
+                '--clean-deps', pkg]
+    if pm == 'emerge':
+        return ['strat', stratum, 'emerge', '--unmerge', '--quiet', pkg]
+    return []
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# UI
+# ───────────────────────────────────────────────────────────────────────────
+
+def render_found(pattern: str, found, total: int) -> None:
+    console.print(Panel.fit(
+        f'[bold cyan]brl-erase[/bold cyan]   pattern: [yellow]{pattern}[/yellow]\n'
+        f'[dim]{total} installed package(s) match across '
+        f'{len(found)} stratum/strata.[/dim]',
+        border_style='cyan',
+    ))
+    table = Table(header_style='bold cyan', box=None, pad_edge=False, padding=(0, 1))
+    table.add_column('STRATUM', style='cyan')
+    table.add_column('PM', style='dim')
+    table.add_column('PACKAGE')
+    table.add_column('NOTE')
+    for stratum, (pm, pkgs) in found.items():
+        first = True
+        for pkg in pkgs:
+            reason = dangerous_reason(pkg)
+            note = (f'[bold red]⚠ {reason}[/bold red]' if reason else '')
+            table.add_row(stratum if first else '', pm if first else '', pkg, note)
+            first = False
+    console.print(table)
+
+
+def triple_confirm(dangerous: list) -> bool:
+    """3-step confirmation for kernel/boot-adjacent packages. ANY 'no' aborts."""
+    by_reason: dict[str, list[str]] = {}
+    for s, _, pkg, reason in dangerous:
+        by_reason.setdefault(reason, []).append(f'{pkg} ({s})')
+    summary_lines = []
+    for reason, items in sorted(by_reason.items()):
+        summary_lines.append(f'  [bold red]{reason}[/bold red]: '
+                             + ', '.join(items[:4])
+                             + (f' +{len(items)-4} more' if len(items) > 4 else ''))
+    summary = '\n'.join(summary_lines)
+
+    console.print(Panel(
+        f'[bold red on yellow]  ⚠  KERNEL / BOOT PACKAGES IN THIS REMOVAL  [/bold red on yellow]\n\n'
+        f'[red]{len(dangerous)} package(s) match a kernel-, libc-, init-, or '
+        f'bootloader-related name pattern.\n'
+        f'Removing them can leave your system [bold]unbootable[/bold] or '
+        f'[bold]unable to run /bin/sh[/bold].[/red]\n\n'
+        f'{summary}',
+        border_style='red',
+        padding=(1, 2),
+    ))
+    prompts = [
+        '[red][1/3] Do you understand this can BRICK boot?[/red]',
+        '[red][2/3] Are you SURE you want to continue?[/red]',
+        '[red][3/3] [bold]Last chance.[/bold] Type yes to proceed.[/red]',
+    ]
+    for p in prompts:
+        if not Confirm.ask(p, default=False):
+            return False
+    return True
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Main
+# ───────────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    ap = argparse.ArgumentParser(
+        prog='brl-erase',
+        description='Bedrock-wide fuzzy package removal '
+                    '(searches every stratum, asks once, kernel/boot stuff '
+                    'triple-confirms).',
+    )
+    ap.add_argument('pattern', nargs='?',
+                    help='substring (default) or regex to match installed package names')
+    ap.add_argument('-y', '--yes', action='store_true',
+                    help='skip the first confirmation (kernel/boot matches still triple-confirm)')
+    ap.add_argument('-r', '--regex', action='store_true',
+                    help='treat <pattern> as a Python regex (case-insensitive)')
+    ap.add_argument('-l', '--list', action='store_true',
+                    help='just show matches and exit; never prompt, never remove')
+    ap.add_argument('-d', '--dry-run', action='store_true',
+                    help='print the removal commands that would run, but execute nothing')
+    ap.add_argument('--no-sudo', action='store_true',
+                    help='never auto-elevate; fail if not already root')
+    ap.add_argument('--run_test', action='store_true', help=argparse.SUPPRESS)
+    return ap.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.run_test:
+        bail()
+    if not args.pattern:
+        console.print('[red]✗ pattern is required.[/red]  Try: [cyan]brl-erase chrome[/cyan]')
+        sys.exit(2)
+    verify_bedrock()
+
+    found = search_all(args.pattern, args.regex)
+    if not found:
+        console.print(f'[yellow]No installed package matches "[bold]{args.pattern}[/bold]"'
+                      f' in any stratum.[/yellow]')
+        sys.exit(0)
+
+    total = sum(len(pkgs) for _, pkgs in found.values())
+    resumed = bool(os.environ.get('BRL_ERASE_CONFIRMED'))
+
+    if not resumed:
+        render_found(args.pattern, found, total)
+
+    if args.list:
+        sys.exit(0)
+
+    if args.dry_run:
+        console.rule('[bold]Dry-run — these commands would be executed[/bold]')
+        for stratum, (pm, pkgs) in found.items():
+            for pkg in pkgs:
+                cmd = remove_cmd(stratum, pm, pkg)
+                if not cmd:
+                    console.print(f'  [yellow]·[/yellow] {stratum}/{pkg}: unsupported pm "{pm}"')
+                    continue
+                console.print(f'  [cyan]→[/cyan] [dim]sudo[/dim] {" ".join(cmd)}')
+        dangerous = collect_dangerous(found)
+        if dangerous:
+            console.print(f'\n[bold red]⚠ {len(dangerous)} kernel/boot-adjacent '
+                          f'match(es) — a real run would triple-confirm.[/bold red]')
+        sys.exit(0)
+
+    if not resumed and not args.yes:
+        if not Confirm.ask(f'\n[bold]Delete {total} package(s)?[/bold]',
+                           default=False):
+            console.print('[dim]Aborted.[/dim]')
+            sys.exit(0)
+
+    if os.geteuid() != 0:
+        if args.no_sudo:
+            console.print('[red]✗ brl-erase needs root and --no-sudo was set.[/red]')
+            sys.exit(1)
+        console.print('[cyan]Elevating via sudo…[/cyan]')
+        os.environ['BRL_ERASE_CONFIRMED'] = '1'
+        argv = ['sudo', '-E', sys.executable,
+                os.path.abspath(__file__)] + sys.argv[1:]
+        os.execvp('sudo', argv)
+        return
+
+    if resumed:
+        render_found(args.pattern, found, total)
+
+    dangerous = collect_dangerous(found)
+    if dangerous:
+        if not triple_confirm(dangerous):
+            console.print('[green]Aborted (kernel/boot safety).[/green]')
+            sys.exit(0)
+
+    results: list[tuple[str, str, str, bool, int]] = []
+    for stratum, (pm, pkgs) in found.items():
+        for pkg in pkgs:
+            cmd = remove_cmd(stratum, pm, pkg)
+            if not cmd:
+                console.print(f'  [yellow]·[/yellow] {stratum}/{pkg}: '
+                              f'unsupported pm "{pm}", skipped')
+                results.append((stratum, pm, pkg, False, -1))
+                continue
+            console.rule(f'[bold]{stratum}[/bold]  [dim]{pm}[/dim]  '
+                         f'[yellow]{pkg}[/yellow]', style='cyan')
+            console.print(f'  [cyan]→ {" ".join(cmd)}[/cyan]')
+            r = subprocess.run(cmd)
+            ok = r.returncode == 0
+            results.append((stratum, pm, pkg, ok, r.returncode))
+            if ok:
+                console.print(f'  [green]✓ removed {pkg}[/green]')
+            else:
+                console.print(f'  [red]✗ {pkg} failed (exit {r.returncode})[/red]')
+
+    n_ok = sum(1 for *_, ok, _ in results if ok)
+    n_fail = len(results) - n_ok
+    console.rule('[bold]Summary[/bold]')
+    console.print(f'  [green]✓ removed: {n_ok}[/green]   '
+                  f'{"[red]" if n_fail else "[dim]"}✗ failed: {n_fail}'
+                  f'{"[/red]" if n_fail else "[/dim]"}')
+    if n_fail:
+        for stratum, pm, pkg, ok, rc in results:
+            if not ok:
+                console.print(f'  [dim red]· {stratum}/{pkg} (exit {rc})[/dim red]')
+    sys.exit(0 if n_fail == 0 else 1)
+
+
+if __name__ == '__main__':
+    main()
