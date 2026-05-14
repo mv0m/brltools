@@ -160,9 +160,9 @@ If brlfetch is missing the line silently no-ops.
 
 ---
 
-## License
+## License MIT
 
-TBD — drop your preferred LICENSE in this directory.
+Basically meaning you can use this code for anything, just notify me and get permission and or give me credits.
 
 ## Contributing
 
