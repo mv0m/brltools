@@ -89,7 +89,7 @@ Checks cover:
 
 Update flow has a per-stratum progress bar with phase labels (downloading/installing/verifying/…) and surfaces known-but-harmless errors (e.g. `grub2-editenv` failures on systemd-boot hosts) so users aren't scared by output that is expected.
 
-### `brlfetch` — system summary
+### `brlfetch` — system summary ( not to be confused with brl fetch )
 
 ```sh
 brlfetch         # full panel: logo + OS + hijacked-from + strata + pkg counts + bootloader + cpu/gpu/mem/disk
