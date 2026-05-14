@@ -1,6 +1,6 @@
 # brltools
 
-A small toolset of Bedrock Linux–specific utilities. Five Python/rich scripts
+A small toolset of Bedrock Linux–specific utilities. Five scripts
 that fill gaps the upstream Bedrock CLI doesn't:
 
 | Tool        | Role                   | What it does                                                                 |
